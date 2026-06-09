@@ -46,12 +46,20 @@ def navigate(page: str):
 
 
 def get_llm_client():
-    """Create LLMClient with current session settings."""
-    return LLMClient(
-        provider=st.session_state.get("llm_provider", "deepseek"),
-        api_key=st.session_state.get("llm_api_key", ""),
-        model=st.session_state.get("llm_model", "")
-    )
+    """Create LLMClient with current session settings (secrets > session state > env)."""
+    provider = st.session_state.get("llm_provider", "deepseek")
+    model = st.session_state.get("llm_model", "")
+    api_key = st.session_state.get("llm_api_key", "")
+
+    # Priority: session state > st.secrets > env var
+    if not api_key:
+        try:
+            secrets_key = f"{provider.upper()}_API_KEY"
+            api_key = st.secrets.get(secrets_key, "")
+        except Exception:
+            pass
+
+    return LLMClient(provider=provider, api_key=api_key, model=model)
 
 
 # ============================================================
@@ -1069,24 +1077,54 @@ def render_settings():
         st.markdown(f"**提供商**: {provider_cfg['name']}")
         st.markdown(f"**模型**: {st.session_state.llm_model}")
     with col2:
-        key_display = "已配置" if st.session_state.llm_api_key else "未配置"
-        if selected_provider == "ollama":
+        # Check if API key is available from secrets
+        has_secrets_key = False
+        try:
+            secrets_key = f"{selected_provider.upper()}_API_KEY"
+            has_secrets_key = bool(st.secrets.get(secrets_key, ""))
+        except Exception:
+            pass
+
+        if st.session_state.llm_api_key:
+            key_display = "✅ 已配置（页面输入）"
+        elif has_secrets_key:
+            key_display = "✅ 已配置（Streamlit Secrets）"
+        elif selected_provider == "ollama":
             key_display = "本地模型"
+        else:
+            key_display = "❌ 未配置"
         st.markdown(f"**API Key**: {key_display}")
         st.markdown(f"**Base URL**: {provider_cfg['base_url']}")
 
-    # Environment variables help
+    # Streamlit Cloud secrets configuration
     st.divider()
-    st.markdown("### 🔑 环境变量配置（可选）")
+    st.markdown("### ☁️ Streamlit Cloud 永久配置")
     st.markdown("""
-    也可以通过 `.env` 文件配置 API Key，优先级：**页面输入 > 环境变量**
+    如果部署到 Streamlit Cloud，可以通过 **Secrets** 永久保存 API Key：
+
+    1. 在 Streamlit Cloud 应用页面，点击右上角 **⋮** → **Settings** → **Secrets**
+    2. 添加以下内容：
+
+    ```toml
+    DEEPSEEK_API_KEY = "sk-xxx"
+    OPENAI_API_KEY = "sk-xxx"
+    ANTHROPIC_API_KEY = "sk-xxx"
+    DASHSCOPE_API_KEY = "sk-xxx"
+    ZHIPUAI_API_KEY = "xxx"
+    ```
+
+    3. 保存后，API Key 将永久生效，无需每次输入。
+    """)
+
+    # Environment variables help
+    st.markdown("### 🔑 本地环境变量（可选）")
+    st.markdown("""
+    也可以通过 `.env` 文件配置 API Key，优先级：**页面输入 > Streamlit Secrets > 环境变量**
 
     ```env
     DEEPSEEK_API_KEY=sk-xxx
     OPENAI_API_KEY=sk-xxx
     ANTHROPIC_API_KEY=sk-xxx
-    DASHSCOPE_API_KEY=sk-xxx
-    ZHIPUAI_API_KEY=xxx
     ```
     """)
 
