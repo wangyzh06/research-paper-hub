@@ -693,8 +693,8 @@ LLM_PROVIDERS = {
     "deepseek": {
         "name": "DeepSeek",
         "base_url": "https://api.deepseek.com/v1",
-        "models": ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"],
-        "default_model": "deepseek-chat",
+        "models": ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-coder", "deepseek-reasoner"],
+        "default_model": "deepseek-v4-flash",
         "env_key": "DEEPSEEK_API_KEY",
     },
     "openai": {
@@ -722,8 +722,8 @@ LLM_PROVIDERS = {
     "glm": {
         "name": "智谱清言 (GLM)",
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "models": ["glm-4-plus", "glm-4-flash", "glm-4-long"],
-        "default_model": "glm-4-flash",
+        "models": ["glm-4.7-flash", "glm-4-plus", "glm-4-flash", "glm-4-long"],
+        "default_model": "glm-4.7-flash",
         "env_key": "ZHIPUAI_API_KEY",
     },
     "ollama": {
