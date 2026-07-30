@@ -2,7 +2,7 @@ import asyncio
 import streamlit as st
 from engine import (
     init_db, save_paper_to_db, add_to_collection, remove_from_collection,
-    get_all_collections, get_collection_detail, create_collection, delete_collection,
+    get_all_collections, get_collection_detail, create_collection, delete_collection, export_bibtex,
     save_note, get_note, delete_note, get_all_notes,
     create_tag, get_all_tags, delete_tag, add_tag_to_paper, remove_tag_from_paper, get_paper_tags,
     OpenAlexClient, LLMClient, DeepSeekClient, PDFProcessor, SearchEngine,
@@ -126,7 +126,7 @@ def render_home():
 # ============================================================
 # Search Page
 # ============================================================
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def _cached_search(query: str, limit: int = 100, sort: str = "relevance") -> list[dict]:
     async def _s():
         engine = SearchEngine()
@@ -145,7 +145,7 @@ def render_search():
         st.session_state.search_query = (q or "").strip()
 
     if st.session_state.search_query:
-        page_size = 20
+        page_size = 30
         if "search_page" not in st.session_state:
             st.session_state.search_page = 0
         if "search_sort" not in st.session_state:
@@ -160,6 +160,10 @@ def render_search():
         with st.spinner("搜索中..."):
             results = _cached_search(st.session_state.search_query, limit=200,
                                      sort=st.session_state.search_sort)
+            # 缓存可能返回空（旧的失败结果），直接搜索一次作为兜底
+            if not results:
+                engine = SearchEngine()
+                results = asyncio.run(engine.search(st.session_state.search_query, limit=200, source="auto", sort=st.session_state.search_sort))
             st.session_state.search_results = results
 
         results = st.session_state.search_results
@@ -391,53 +395,60 @@ def _render_graph_panel(paper: dict, key: str):
 
     if "graph_depth" not in st.session_state:
         st.session_state.graph_depth = 1
+    if "graph_year_filter" not in st.session_state:
+        st.session_state.graph_year_filter = (1970, 2030)
 
-    depth = st.select_slider("图谱深度", options=[1, 2], value=st.session_state.graph_depth,
-                              help="深度1：直接引用关系；深度2：引用的引用")
-    st.session_state.graph_depth = depth
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        depth = st.select_slider("图谱深度", options=[1, 2], value=st.session_state.graph_depth,
+                                  help="深度1：直接引用；深度2：引用的引用")
+        st.session_state.graph_depth = depth
+    with c2:
+        min_year = st.number_input("起始年份", 1970, 2030, st.session_state.graph_year_filter[0], step=1, key=f"{key}_minyr")
+    with c3:
+        max_year = st.number_input("截止年份", 1970, 2030, st.session_state.graph_year_filter[1], step=1, key=f"{key}_maxyr")
+    st.session_state.graph_year_filter = (min_year, max_year)
 
     with st.spinner("生成引用图谱..."):
         async def _build_deep(d: int):
             pid = paper.get("id", "")
-            nodes_map = {}
-            edges = []
+            nodes_map, edges = {}, []
 
             async def fetch_level(wid: str, current_depth: int, relation: str):
                 if current_depth > d or wid in nodes_map:
                     return
                 if wid == paper.get("id", ""):
-                    label = paper.get("title", "当前论文")[:40]
-                    year = paper.get("year", "")
-                    url = paper.get("url", "")
-                    nodes_map[wid] = {"label": label, "year": year, "url": url,
-                                      "color": "#e74c3c", "size": 30, "depth": 0}
+                    cc = paper.get("citation_count", 0)
+                    yr = paper.get("year", "")
+                    abstract = (paper.get("abstract") or "")[:200]
+                    nodes_map[wid] = {"title": paper.get("title", "当前论文")[:60],
+                                      "year": yr, "citation_count": cc, "abstract": abstract,
+                                      "url": paper.get("url", ""), "is_center": True, "depth": 0}
                 async with OpenAlexClient() as oa:
-                    cited = await oa.get_cited_by(wid, limit=20)
-                    refs = await oa.get_references(wid, limit=20)
+                    cited = await oa.get_cited_by(wid, limit=25)
+                    refs = await oa.get_references(wid, limit=25)
                 for p in cited.get("results", []):
                     nid = p.get("id", "")
-                    if not nid or nid in nodes_map:
-                        continue
-                    lt = (p.get("title") or "")[:35]
-                    yr = str(p.get("year") or "")
-                    url_link = f"https://openalex.org/{nid}"
-                    nodes_map[nid] = {"label": lt, "year": yr, "url": url_link,
-                                      "color": "#3498db", "size": 15, "depth": current_depth}
+                    if not nid or nid in nodes_map: continue
+                    yr = p.get("year") or 9999
+                    if yr < min_year or yr > max_year: continue
+                    nodes_map[nid] = {"title": (p.get("title") or "")[:60],
+                                      "year": yr, "citation_count": p.get("citation_count", 0),
+                                      "abstract": "", "url": f"https://openalex.org/{nid}",
+                                      "is_center": False, "depth": current_depth}
                     edges.append({"from": nid, "to": wid})
-                    if current_depth < d:
-                        await fetch_level(nid, current_depth + 1, "citing")
+                    if current_depth < d: await fetch_level(nid, current_depth + 1, "citing")
                 for p in refs.get("results", []):
                     nid = p.get("id", "")
-                    if not nid or nid in nodes_map:
-                        continue
-                    lt = (p.get("title") or "")[:35]
-                    yr = str(p.get("year") or "")
-                    url_link = f"https://openalex.org/{nid}"
-                    nodes_map[nid] = {"label": lt, "year": yr, "url": url_link,
-                                      "color": "#2ecc71", "size": 15, "depth": current_depth}
+                    if not nid or nid in nodes_map: continue
+                    yr = p.get("year") or 9999
+                    if yr < min_year or yr > max_year: continue
+                    nodes_map[nid] = {"title": (p.get("title") or "")[:60],
+                                      "year": yr, "citation_count": p.get("citation_count", 0),
+                                      "abstract": "", "url": f"https://openalex.org/{nid}",
+                                      "is_center": False, "depth": current_depth}
                     edges.append({"from": wid, "to": nid})
-                    if current_depth < d:
-                        await fetch_level(nid, current_depth + 1, "ref")
+                    if current_depth < d: await fetch_level(nid, current_depth + 1, "ref")
 
             await fetch_level(pid, 1, "center")
             return nodes_map, edges
@@ -445,36 +456,64 @@ def _render_graph_panel(paper: dict, key: str):
         nodes_map, edges = asyncio.run(_build_deep(depth))
 
     if not nodes_map:
-        st.info("该论文暂无引用数据")
+        st.info("该论文暂无引用数据（或年份筛选无结果）")
     else:
         from pyvis.network import Network as PNetwork
         import networkx as nx
         G = nx.DiGraph()
+
+        # Year color mapping: older=cool blue, newer=warm red
+        years = [nd.get("year") or 2020 for nd in nodes_map.values()]
+        yr_min, yr_max = min(years), max(years)
+        yr_range = max(1, yr_max - yr_min)
+
+        def year_color(yr):
+            if not yr: return "#888888"
+            ratio = (yr - yr_min) / yr_range
+            r = int(100 + 155 * ratio)
+            g = int(100 + 55 * (1 - ratio))
+            b = int(200 - 100 * ratio)
+            return f"#{r:02x}{g:02x}{b:02x}"
+
+        # Citation-based sizing
+        max_cc = max((nd.get("citation_count", 0) for nd in nodes_map.values()), default=1)
+        def node_size(cc, is_center):
+            if is_center: return 40
+            return max(8, min(30, 10 + (cc / max(1, max_cc)) * 20))
+
         for nid, nd in nodes_map.items():
-            year_str = f" ({nd['year']})" if nd.get("year") else ""
-            lt = nd["label"] + year_str
-            title_html = f"<a href='{nd.get('url','#')}' target='_blank'>{nd['label']}</a>"
-            if nd.get("year"):
-                title_html += f"<br/>📅 {nd['year']}"
-            G.add_node(nid, label=lt, title=title_html, size=nd["size"], color=nd["color"])
+            yr_str = f" ({nd.get('year')})" if nd.get("year") else ""
+            lt = nd["title"][:35] + yr_str
+            tooltip = f"<b>{nd['title']}</b>"
+            if nd.get("year"): tooltip += f"<br/>📅 {nd['year']}"
+            tooltip += f"<br/>📊 引用 {nd.get('citation_count', 0)}"
+            if nd.get("abstract"): tooltip += f"<br/><br/>{nd['abstract'][:150]}"
+            if nd.get("url"): tooltip += f"<br/><a href='{nd['url']}' target='_blank'>打开论文</a>"
+            is_c = nd.get("is_center", False)
+            G.add_node(nid, label=lt, title=tooltip,
+                       size=node_size(nd.get("citation_count", 0), is_c),
+                       color=year_color(nd.get("year")) if not is_c else "#e74c3c")
         for e in edges:
             G.add_edge(e["from"], e["to"])
 
-        net = PNetwork(height="600px", width="100%", directed=True)
+        net = PNetwork(height="650px", width="100%", directed=True)
         net.from_nx(G)
         net.set_options("""
         {
-          "nodes": { "font": {"size": 13, "face": "Arial"} },
-          "edges": { "arrows": {"to": {"enabled": true}}, "smooth": {"type": "curvedCW"} },
-          "interaction": { "hover": true, "tooltipDelay": 200 },
-          "physics": { "solver": "forceAtlas2Based", "stabilization": {"iterations": 200} }
+          "nodes": { "font": {"size": 13, "face": "Arial"}, "borderWidth": 2 },
+          "edges": { "arrows": {"to": {"enabled": true}}, "smooth": {"type": "curvedCW"},
+                     "color": {"color": "#aaa", "opacity": 0.5} },
+          "interaction": { "hover": true, "tooltipDelay": 100, "navigationButtons": true },
+          "physics": { "solver": "forceAtlas2Based", "stabilization": {"iterations": 300},
+                       "forceAtlas2Based": {"gravitationalConstant": -50, "springLength": 200} }
         }
         """)
         net.save_graph("_graph.html")
         with open("_graph.html", "r", encoding="utf-8") as f:
-            st.components.v1.html(f.read(), height=620)
+            st.components.v1.html(f.read(), height=670)
 
-    st.caption("🔴 当前论文 · 🔵 引用该论文 · 🟢 被该论文引用 · 悬停查看详情 · 点击标题打开论文")
+    st.caption(
+        "🔴 当前论文 · 🔵← 旧论文 · 🔴→ 新论文 · 节点大小=引用数 · 悬停看详情 · 可拖拽")
     if st.button("✖ 关闭图谱", key=f"{key}_close_graph"):
         st.session_state.show_graph = ""
         st.rerun()
@@ -585,21 +624,42 @@ def render_collections():
         st.info("暂无文献库，点击上方按钮创建")
         return
 
+    # Display collections with enhanced cards
     cols = st.columns(3)
     for i, c in enumerate(collections):
+        detail = get_collection_detail(c["id"])
+        papers = detail["papers"] if detail else []
+        total_cc = sum(p.get("citation_count", 0) or 0 for p in papers)
+        avg_cc = round(total_cc / max(1, len(papers)), 1) if papers else 0
         with cols[i % 3]:
             with st.container(border=True):
                 st.markdown(f"### 📁 {c['name']}")
-                st.caption(f"{c['papers_count']} 篇论文")
+                st.caption(f"📄 {c['papers_count']} 篇 · 📊 总引用 {total_cc} · 均引用 {avg_cc}")
                 if c.get("description"):
                     st.caption(c["description"])
-                c1, c2 = st.columns(2)
+                c1, c2, c3 = st.columns(3)
                 if c1.button("查看", key=f"view_{c['id']}", use_container_width=True):
                     st.session_state.view_collection = c["id"]
                     st.rerun()
-                if c2.button("删除", key=f"del_{c['id']}", use_container_width=True):
+                if c2.button("📥 BibTeX", key=f"bib_{c['id']}", use_container_width=True):
+                    bib = export_bibtex(c["id"])
+                    if bib:
+                        st.session_state.bibtex_data = bib
+                        st.rerun()
+                    else:
+                        st.warning("该文献库暂无论文")
+                if c3.button("删除", key=f"del_{c['id']}", use_container_width=True):
                     delete_collection(c["id"])
                     st.rerun()
+
+    # BibTeX download dialog
+    if st.session_state.get("bibtex_data"):
+        with st.expander("📥 导出 BibTeX", expanded=True):
+            st.code(st.session_state.bibtex_data, language="bibtex")
+            st.download_button("💾 下载 .bib 文件", st.session_state.bibtex_data, "papers.bib", "text/plain")
+            if st.button("关闭"):
+                st.session_state.bibtex_data = None
+                st.rerun()
 
     # View collection detail
     if st.session_state.get("view_collection"):
@@ -609,30 +669,78 @@ def render_collections():
             st.divider()
             st.markdown(f"### 📁 {detail['name']}")
             st.caption(detail.get("description", ""))
-            if not detail["papers"]:
+
+            papers = detail["papers"]
+            total_cc = sum(p.get("citation_count", 0) or 0 for p in papers)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("论文数", len(papers))
+            c2.metric("总引用", total_cc)
+            c3.metric("平均引用", round(total_cc / max(1, len(papers)), 1))
+            c4.metric("最高引用", max((p.get("citation_count", 0) or 0 for p in papers), default=0))
+
+            if not papers:
                 st.info("该文献库暂无论文")
             else:
-                for p in detail["papers"]:
-                    with st.container(border=True):
-                        st.markdown(f"**{p['title']}**")
-                        metas = []
-                        if p.get("year"): metas.append(str(p["year"]))
-                        if p.get("venue"): metas.append(p["venue"])
-                        if p.get("citation_count"): metas.append(f"引用 {p['citation_count']}")
-                        if metas: st.caption(" · ".join(metas))
-                        if st.button("🗑️ 移除", key=f"rem_{cid}_{p['id']}"):
-                            remove_from_collection(cid, p["id"])
-                            st.rerun()
+                # Tag filter
+                all_tags = get_all_tags()
+                if all_tags:
+                    tag_names = {t["id"]: t["name"] for t in all_tags}
+                    selected_tags = st.multiselect("🏷️ 按标签筛选", list(tag_names.keys()),
+                        format_func=lambda x: tag_names[x], key=f"tag_filter_{cid}")
+                    if selected_tags:
+                        papers = [p for p in papers if any(
+                            t in [tp["id"] for tp in get_paper_tags(p["id"])] for t in selected_tags
+                        )]
+                        st.caption(f"筛选后: {len(papers)} 篇")
 
-            if st.button("🤖 推荐相似论文", key=f"rec_{cid}"):
+                # Sort
+                sort_by = st.selectbox("排序", ["引用数", "年份"], key=f"sort_{cid}")
+                if sort_by == "引用数":
+                    papers.sort(key=lambda p: p.get("citation_count", 0) or 0, reverse=True)
+                else:
+                    papers.sort(key=lambda p: p.get("year") or 0, reverse=True)
+
+                # Batch remove
+                batch_mode = st.checkbox("批量删除模式", key=f"batch_{cid}")
+                to_remove = []
+                for p in papers:
+                    with st.container(border=True):
+                        c1, c2, c3 = st.columns([batch_mode and 0.5 or 4, 1.5, 1])
+                        with c1:
+                            if batch_mode:
+                                if st.checkbox("", key=f"sel_{cid}_{p['id']}"):
+                                    to_remove.append(p["id"])
+                            st.markdown(f"**{p['title'][:80]}**")
+                            meta = []
+                            if p.get("year"): meta.append(str(p["year"]))
+                            if p.get("venue"): meta.append(p["venue"])
+                            if p.get("citation_count"): meta.append(f"引用 {p['citation_count']}")
+                            if meta: st.caption(" · ".join(meta))
+                        with c2:
+                            if not batch_mode and st.button("🗑️", key=f"rem_{cid}_{p['id']}"):
+                                remove_from_collection(cid, p["id"])
+                                st.rerun()
+                        with c3:
+                            paper_tags = get_paper_tags(p["id"])
+                            if paper_tags:
+                                tag_html = " ".join(f'<span style="background:{t["color"]};color:#fff;padding:1px 6px;border-radius:6px;font-size:0.7rem">{t["name"]}</span>' for t in paper_tags)
+                                st.markdown(tag_html, unsafe_allow_html=True)
+                if batch_mode and to_remove:
+                    if st.button(f"🗑️ 删除选中的 {len(to_remove)} 篇", type="primary"):
+                        for pid in to_remove:
+                            remove_from_collection(cid, pid)
+                        st.rerun()
+
+            c1, c2 = st.columns(2)
+            if c1.button("🤖 推荐相似论文", key=f"rec_{cid}"):
                 with st.spinner("搜索推荐中..."):
                     titles = " ".join(p.get("title", "") for p in detail["papers"][:5])
                     if titles:
                         engine = SearchEngine()
-                        recs = asyncio.run(engine.search(titles[:200], limit=10, source="auto"))
+                        recs = asyncio.run(engine.search(titles[:200], limit=15, source="auto"))
                         if recs:
                             st.markdown("### 推荐论文")
-                            for r in recs:
+                            for r in recs[:10]:
                                 with st.container(border=True):
                                     st.markdown(f"**{r.get('title', '')}**")
                                     if r.get("year"): st.caption(f"📅 {r['year']}")
@@ -663,50 +771,62 @@ def render_consensus():
             st.warning("未找到相关论文")
             return
 
-        # 按标题关键词相关性 + 引用数筛选
-        topic_lower = topic_text.lower()
-        stop_words = {"the", "a", "an", "is", "are", "of", "in", "on", "to", "for",
-                      "with", "and", "or", "by", "at", "from", "as", "be", "it", "we"}
-        topic_terms = {w for w in topic_lower.replace('/', ' ').split() if w not in stop_words and len(w) > 1}
+        # 用 TF-IDF 语义相似度筛选最相关的20篇论文
+        with st.spinner("计算语义相关性..."):
+            # Build text corpus: topic + all paper titles/abstracts
+            texts = [topic_text] + [f"{p.get('title', '')} {(p.get('abstract') or '')[:500]}" for p in candidates]
+            try:
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                from sklearn.metrics.pairwise import cosine_similarity
+                vectorizer = TfidfVectorizer(max_features=2000, stop_words="english")
+                tfidf = vectorizer.fit_transform(texts)
+                sims = cosine_similarity(tfidf[0:1], tfidf[1:])[0]
+            except ImportError:
+                # Fallback: simple keyword overlap
+                t_terms = set(topic_text.lower().split())
+                sims = []
+                for p in candidates:
+                    t = f"{p.get('title','')} {(p.get('abstract') or '')}".lower()
+                    sims.append(sum(1 for term in t_terms if term in t) / max(1, len(t_terms)))
 
-        def relevance(p: dict) -> int:
-            title = (p.get("title") or "").lower()
-            score = sum(1 for t in topic_terms if t in title)
-            if p.get("abstract"):
-                abstract_lower = p["abstract"].lower() if p["abstract"] else ""
-                score += sum(1 for t in topic_terms if t in abstract_lower)
-            return score
+            for i, p in enumerate(candidates):
+                p["_sim"] = float(sims[i]) if i < len(sims) else 0
+            candidates.sort(key=lambda p: p.get("_sim", 0), reverse=True)
 
-        # 取相关性 >= 1 的论文，按引用数排序，取前30
-        relevant = [p for p in candidates if relevance(p) >= 1]
-        if len(relevant) < 5 and candidates:
-            # 相关性太弱时至少保留前10篇最高引用的
-            relevant = sorted(candidates, key=lambda p: p.get("citation_count", 0), reverse=True)[:10]
-
-        relevant.sort(key=lambda p: (relevance(p), p.get("citation_count", 0)), reverse=True)
-        papers = relevant[:30]
+        papers = candidates[:30]
         st.info(f"从 {len(candidates)} 篇中筛选出 {len(papers)} 篇高相关论文")
 
         with st.spinner("AI 共识分析中..."):
-            paper_list = "\n".join(f"[{i+1}] {p.get('title','')} ({p.get('year','')})" for i, p in enumerate(papers[:20]))
-            paper_texts = "\n\n".join(f"[{i+1}] {p.get('title','')}\n{(p.get('abstract') or '')[:800]}" for i, p in enumerate(papers[:20]))
+            paper_list = "\n".join(f"[{i+1}] {p.get('title','')} ({p.get('year','')})" for i, p in enumerate(papers))
+            paper_texts = "\n\n".join(f"[{i+1}] {p.get('title','')}\n{(p.get('abstract') or '')[:800]}" for i, p in enumerate(papers))
             async def _analyze():
                 async with get_llm_client() as c:
                     prompt = (
-                        f"请分析以下 {min(len(papers), 20)} 篇论文在「{topic_text}」主题上的共识程度。\n\n"
-                        "请按以下格式输出：\n"
-                        "1. 共识度评分 (0-100)\n"
-                        "2. 摘要描述\n"
-                        "3. 主要一致观点（每点引用论文编号，如 [1][3]）\n"
-                        "4. 主要分歧（每点引用论文编号）\n"
-                        "5. 按论文列出立场：\n"
-                        "   [1] 论文标题 — 支持/反对/中立 — 简要说明\n"
-                        "   [2] ...\n\n"
+                        f"你是一个学术研究分析专家。请对以下 {len(papers)} 篇关于「{topic_text}」的论文进行深度共识分析。\n\n"
+                        "请按以下格式输出完整报告：\n\n"
+                        "## 1. 共识度评分\n"
+                        "给出0-100的共识度评分，说明评分依据。\n\n"
+                        "## 2. 研究方法分布\n"
+                        "统计这组论文采用的研究方法（实验/理论/模拟/综述等），评估整体证据质量（高/中/低）。\n\n"
+                        "## 3. 主要一致观点\n"
+                        "列出3-5个学术界一致认同的发现，每点标注支持论文编号。\n\n"
+                        "## 4. 主要争议与分歧\n"
+                        "列出存在分歧的观点，说明各方立场及论文编号，分析分歧原因（方法差异/数据差异/理论框架差异）。\n\n"
+                        "## 5. 研究空白\n"
+                        "基于现有论文，识别2-3个尚未充分研究的问题或方向。\n\n"
+                        "## 6. 方法论评估\n"
+                        "对比各论文的研究方法优劣，指出可能的方法学局限（样本量、实验设计、统计方法等）。\n\n"
+                        "## 7. 统计证据强度\n"
+                        "评估关键结论的统计证据强度（效应量、显著性、可重复性），标注需要更多验证的结论。\n\n"
+                        "## 8. 论文立场标注\n"
+                        "按以下格式标注每篇论文在核心议题上的立场：\n"
+                        "[1] 论文标题 — ✅支持/❌反对/➖中立 — 关键论据\n"
+                        "[2] ...\n\n"
                         f"论文列表：\n{paper_list}\n\n"
                         f"论文详情：\n{paper_texts}"
                     )
                     return await c._complete([
-                        {"role": "system", "content": "你是专业的学术共识分析助手。请务必按格式输出，每项声明都要引用论文编号。"},
+                        {"role": "system", "content": "你是专业的学术共识分析专家。请生成详细、有深度的分析报告，每项声明都必须引用论文编号。"},
                         {"role": "user", "content": prompt},
                     ])
             analysis = asyncio.run(_analyze())
@@ -731,7 +851,7 @@ def render_consensus():
 
         st.divider()
         st.markdown(f"### 相关论文 ({len(papers)} 篇)")
-        for i, p in enumerate(papers[:20]):
+        for i, p in enumerate(papers[:30]):
             with st.expander(f"[{i+1}] {p.get('title', '无标题')}"):
                 st.caption((p.get("abstract") or "")[:500])
                 meta = []
@@ -945,8 +1065,36 @@ def render_canvas():
         papers = detail["papers"]
         st.markdown(f"### 📁 {detail['name']} ({len(papers)} 篇)")
 
+        # PCA topic visualization
+        try:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            from sklearn.decomposition import PCA
+            titles = [p["title"] or "" for p in papers]
+            vectorizer = TfidfVectorizer(max_features=50, stop_words="english")
+            X = vectorizer.fit_transform(titles)
+            pca = PCA(n_components=2)
+            coords = pca.fit_transform(X.toarray())
+            import plotly.express as px
+            import pandas as pd
+            df = pd.DataFrame({
+                "x": coords[:, 0], "y": coords[:, 1],
+                "title": [p["title"][:40] for p in papers],
+                "year": [p.get("year", 0) for p in papers],
+                "citations": [p.get("citation_count", 0) or 0 for p in papers],
+            })
+            fig = px.scatter(df, x="x", y="y", hover_name="title",
+                             hover_data=["year", "citations"],
+                             size="citations", size_max=30, color="year",
+                             color_continuous_scale="Plasma",
+                             title="📊 论文学术分布图（位置=相似度 · 颜色=年份 · 大小=引用数）")
+            fig.update_layout(height=450)
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception:
+            pass
+
         # Visual grid layout with paper cards
-        cols_per_row = 3
+        show_tags = st.checkbox("显示标签", True, key="canvas_show_tags")
+        cols_per_row = 4
         for i in range(0, len(papers), cols_per_row):
             cols = st.columns(cols_per_row)
             for j, col in enumerate(cols):

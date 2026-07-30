@@ -183,8 +183,14 @@ class Tag(Base):
 def save_paper_to_db(paper_dict: dict) -> int:
     db = SessionLocal()
     try:
-        oaid = paper_dict.get("id", "")
-        existing = db.query(Paper).filter(Paper.openalex_id == oaid).first()
+        oaid = paper_dict.get("id", "") or paper_dict.get("openalex_id", "")
+        existing = None
+        if oaid:
+            existing = db.query(Paper).filter(Paper.openalex_id == oaid).first()
+        if not existing:
+            sem_id = paper_dict.get("semantic_id", "") or paper_dict.get("id", "")
+            if sem_id and sem_id.startswith("arxiv"):
+                existing = db.query(Paper).filter(Paper.semantic_id == sem_id).first()
         if existing:
             return existing.id
         p = Paper(
@@ -193,8 +199,8 @@ def save_paper_to_db(paper_dict: dict) -> int:
             year=paper_dict.get("year"),
             venue=paper_dict.get("venue", ""),
             citation_count=paper_dict.get("citation_count", 0),
-            openalex_id=oaid,
-            semantic_id=paper_dict.get("semantic_id", ""),
+            openalex_id=oaid or None,
+            semantic_id=(paper_dict.get("semantic_id") or None),
             url=paper_dict.get("url", ""),
             created_at=_utcnow(),
         )
@@ -286,6 +292,32 @@ def delete_collection(collection_id: int) -> None:
         if c:
             db.delete(c)
             db.commit()
+    finally:
+        db.close()
+
+
+def export_bibtex(collection_id: int) -> str:
+    """Export collection papers as BibTeX"""
+    db = SessionLocal()
+    try:
+        c = db.query(Collection).get(collection_id)
+        if not c or not c.papers:
+            return ""
+        entries = []
+        for p in c.papers:
+            author_str = " and ".join(a.name for a in p.authors[:5]) if p.authors else "Unknown"
+            cite_key = f"{author_str.split(' and ')[0].split(',')[0].strip().replace(' ','')}{p.year or '0000'}{p.title[:3].replace(' ','')}"
+            entry = f"@article{{{cite_key},\n"
+            entry += f"  title = {{{p.title}}},\n"
+            entry += f"  author = {{{author_str}}},\n"
+            entry += f"  year = {{{p.year or '0000'}}},\n"
+            if p.venue: entry += f"  journal = {{{p.venue}}},\n"
+            if p.abstract: entry += f"  abstract = {{{p.abstract[:200]}}},\n"
+            if p.url: entry += f"  url = {{{p.url}}},\n"
+            if p.openalex_id: entry += f"  note = {{OpenAlex: {p.openalex_id}}},\n"
+            entry += "}\n"
+            entries.append(entry)
+        return "\n".join(entries)
     finally:
         db.close()
 
@@ -949,8 +981,7 @@ _ARXIV_NS = "http://www.w3.org/2005/Atom"
 
 class ArxivClient:
     def __init__(self):
-        self.client = httpx.AsyncClient(base_url="http://export.arxiv.org/api",
-                                        follow_redirects=True, timeout=15.0)
+        self.client = httpx.AsyncClient(base_url="https://export.arxiv.org/api", timeout=15.0)
 
     async def __aenter__(self):
         return self
@@ -1001,6 +1032,106 @@ class ArxivClient:
             return {"results": [], "total": 0}
 
 
+import xml.etree.ElementTree as ET2
+
+# ============================================================
+# Crossref Client
+# ============================================================
+class CrossrefClient:
+    def __init__(self):
+        self.client = httpx.AsyncClient(
+            base_url="https://api.crossref.org",
+            headers={"User-Agent": "ResearchPaperHub/4.0 (mailto:research@example.com)"},
+            timeout=15.0,
+        )
+
+    async def __aenter__(self): return self
+    async def __aexit__(self, *args): await self.client.aclose()
+
+    async def search(self, query: str, limit: int = 20) -> dict:
+        try:
+            r = await self.client.get("/works", params={"query": query, "rows": min(limit, 100)})
+            r.raise_for_status()
+            data = r.json()
+            items = data.get("message", {}).get("items", [])
+            results = []
+            for w in items:
+                doi = w.get("DOI", "")
+                created = w.get("created", {}) or {}
+                date_parts = created.get("date-parts", [[None]]) or [[None]]
+                year = (date_parts[0] or [None])[0] if date_parts else None
+                authors = [{"name": f"{(a.get('given',''))} {(a.get('family',''))}".strip()}
+                          for a in w.get("author", [])]
+                results.append({
+                    "id": doi,
+                    "title": (w.get("title") or [""])[0],
+                    "abstract": w.get("abstract", ""),
+                    "year": year,
+                    "citation_count": w.get("is-referenced-by-count", 0),
+                    "venue": (w.get("container-title") or [""])[0] if w.get("container-title") else "",
+                    "authors": authors,
+                    "doi": doi,
+                    "url": f"https://doi.org/{doi}" if doi else "",
+                })
+            return {"results": results, "total": data.get("message", {}).get("total-results", 0)}
+        except Exception:
+            return {"results": [], "total": 0}
+
+
+# ============================================================
+# PubMed Client
+# ============================================================
+class PubMedClient:
+    def __init__(self):
+        self.client = httpx.AsyncClient(
+            base_url="https://eutils.ncbi.nlm.nih.gov/entrez/eutils",
+            timeout=15.0,
+        )
+
+    async def __aenter__(self): return self
+    async def __aexit__(self, *args): await self.client.aclose()
+
+    async def search(self, query: str, limit: int = 20) -> dict:
+        try:
+            # Step 1: Search for PubMed IDs
+            r = await self.client.get("/esearch.fcgi", params={
+                "db": "pubmed", "term": query, "retmax": min(limit, 100),
+                "retmode": "json", "sort": "relevance",
+            })
+            r.raise_for_status()
+            id_list = r.json().get("esearchresult", {}).get("idlist", [])
+            if not id_list:
+                return {"results": [], "total": 0}
+
+            # Step 2: Fetch summaries
+            r2 = await self.client.get("/esummary.fcgi", params={
+                "db": "pubmed", "id": ",".join(id_list), "retmode": "json",
+            })
+            r2.raise_for_status()
+            result_data = r2.json().get("result", {})
+            results = []
+            for pid in id_list:
+                info = result_data.get(pid, {})
+                if not info:
+                    continue
+                authors = [{"name": a.get("name", "")}
+                          for a in info.get("authors", [])]
+                results.append({
+                    "id": pid,
+                    "title": info.get("title", ""),
+                    "abstract": info.get("elocationid", ""),
+                    "year": int(info.get("pubdate", "2020")[:4]) if info.get("pubdate") else None,
+                    "citation_count": 0,
+                    "venue": info.get("source", ""),
+                    "authors": authors,
+                    "doi": info.get("elocationid", "").replace("doi: ", "") if "doi" in info.get("elocationid", "") else "",
+                    "url": f"https://pubmed.ncbi.nlm.nih.gov/{pid}/",
+                })
+            return {"results": results, "total": len(results)}
+        except Exception:
+            return {"results": [], "total": 0}
+
+
 # ============================================================
 # Search Engine
 # ============================================================
@@ -1013,17 +1144,18 @@ def _contains_chinese(text: str) -> bool:
 
 class SearchEngine:
     def __init__(self):
-        self._oa = None
-        self._arx = None
-        self._ss = None
+        self._oa = None  # OpenAlex
+        self._arx = None # arXiv
+        self._ss = None  # Semantic Scholar
+        self._cr = None  # Crossref
+        self._pm = None  # PubMed
 
     async def _ensure_clients(self):
-        if self._oa is None:
-            self._oa = OpenAlexClient()
-        if self._arx is None:
-            self._arx = ArxivClient()
-        if self._ss is None:
-            self._ss = SemanticScholarClient()
+        if self._oa is None: self._oa = OpenAlexClient()
+        if self._arx is None: self._arx = ArxivClient()
+        if self._ss is None: self._ss = SemanticScholarClient()
+        if self._cr is None: self._cr = CrossrefClient()
+        if self._pm is None: self._pm = PubMedClient()
 
     async def _translate_to_english(self, chinese_query: str) -> str:
         try:
@@ -1072,44 +1204,87 @@ class SearchEngine:
             results = self._deduplicate(raw, limit)
             return self._sort_results(query, results, sort)
 
-        # "auto" / default: OpenAlex + arXiv
+        # "auto" / default: 四源并行检索
+        # OpenAlex + arXiv + Crossref (+ Semantic Scholar if key available)
         oa_raw = await self._search_oa_expanded(expanded, limit * 3)
-        oa_results = self._deduplicate(oa_raw, limit * 2)
-        arx_results = []
+        arx_raw, cr_raw, ss_raw = [], [], []
+        tasks = []
         for eq in expanded[:2]:
-            r = await self._arx.search(eq, max_results=40)
-            for p in r.get("results", []):
-                if p.get("title"):
-                    arx_results.append(p)
-        arx_results = self._deduplicate(arx_results, 30)
+            tasks.append(self._arx.search(eq, max_results=40))
+            tasks.append(self._cr.search(eq, limit=40))
+        if SEMANTIC_SCHOLAR_API_KEY:
+            for eq in expanded[:2]:
+                tasks.append(self._ss.search(eq, limit=40))
 
-        # 按源配额合并：15 OA + 5 arXiv（保证多样性）
-        oa_slots = min(limit - min(5, limit // 4), max(3, len(oa_results)))
-        arx_slots = limit - oa_slots
-        merged = oa_results[:oa_slots] + arx_results[:arx_slots]
-        if len(merged) < limit and len(arx_results) > arx_slots:
-            merged += arx_results[arx_slots:limit - len(merged)]
+        gathered = await _asyncio.gather(*tasks, return_exceptions=True)
+        idx = 0
+        for _ in expanded[:2]:
+            r = gathered[idx]; idx += 1
+            if isinstance(r, dict): arx_raw.extend(r.get("results", []))
+            r = gathered[idx]; idx += 1
+            if isinstance(r, dict): cr_raw.extend(r.get("results", []))
+        if SEMANTIC_SCHOLAR_API_KEY:
+            for _ in expanded[:2]:
+                r = gathered[idx]; idx += 1
+                if isinstance(r, list): ss_raw.extend(r)
+
+        # Tag sources
+        for p in cr_raw: p["source"] = "crossref"
+        for p in arx_raw: p["source"] = "arxiv"
+        for p in ss_raw:
+            p = {"id": p.get("paperId", ""), "source": "semantic_scholar",
+                 "title": p.get("title", ""), "abstract": p.get("abstract", ""),
+                 "year": p.get("year"), "citation_count": p.get("citationCount", 0),
+                 "venue": (p.get("journal") or {}).get("name", ""),
+                 "authors": [{"name": a.get("name", "")} for a in p.get("authors", [])],
+                 "url": p.get("url", ""), "doi": "", "_source": "ss"}
+
+        # DOI 去重 + 合并
+        merged = self._doi_deduplicate(
+            oa_raw + arx_raw + cr_raw + ss_raw, limit * 3
+        )
         return self._sort_results(query, merged[:limit], sort)
 
     async def _search_oa_expanded(self, queries: list[str], limit: int) -> list[dict]:
         per_q = max(30, limit // max(1, len(queries)) + 5)
         tasks = [self._oa.search(q, per_q) for q in queries]
-        results = await _asyncio.gather(*tasks, return_exceptions=True)
+        results_list = await _asyncio.gather(*tasks, return_exceptions=True)
         all_papers = []
-        for r in results:
-            if not isinstance(r, dict):
-                continue
-            for p in r.get("results", []):
-                p["source"] = "openalex"
-                all_papers.append(p)
+        for r in results_list:
+            if isinstance(r, dict):
+                for p in r.get("results", []):
+                    p["source"] = "openalex"
+                    all_papers.append(p)
         return all_papers
+
+    def _doi_deduplicate(self, papers: list[dict], limit: int) -> list[dict]:
+        """DOI优先去重，再用标题去重"""
+        seen_doi = set()
+        seen_title = set()
+        unique = []
+        for p in papers:
+            doi = (p.get("doi") or "").lower().strip()
+            if doi and doi in seen_doi:
+                continue
+            if doi:
+                seen_doi.add(doi)
+            title_key = (p.get("title") or "").lower().strip()[:80]
+            if title_key and title_key in seen_title:
+                continue
+            if title_key:
+                seen_title.add(title_key)
+            unique.append(p)
+        return unique[:limit]
 
     def _sort_results(self, query: str, papers: list[dict], sort: str) -> list[dict]:
         if sort == "year":
             papers.sort(key=lambda p: p.get("year") or 0, reverse=True)
         elif sort == "citations":
             papers.sort(key=lambda p: p.get("citation_count", 0), reverse=True)
-        else:  # "relevance" — keyword overlap score
+        elif sort == "ai_rank":
+            # LLM rerank happens lazily at call site
+            papers.sort(key=lambda p: p.get("citation_count", 0), reverse=True)
+        else:  # "relevance"
             stop = {"the","a","an","is","are","of","in","on","to","for","with",
                     "and","or","by","at","from","as","be","it","we","this","that"}
             q_terms = {w for w in query.lower().replace("/", " ").split()
