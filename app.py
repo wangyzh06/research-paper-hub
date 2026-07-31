@@ -762,18 +762,69 @@ def render_consensus():
 
     if st.button("🔬 开始分析", type="primary", disabled=not topic.strip()):
         topic_text = topic.strip()
+        candidates = []
+        all_rounds = 0
+        max_rounds = 2  # 搜2轮共400篇
 
-        with st.spinner("搜索相关论文（最多200篇）..."):
-            engine = SearchEngine()
-            candidates = asyncio.run(engine.search(topic_text, limit=200, source="auto"))
+        # 先搜完所有轮次，再统一过滤
+        search_tasks = []
+        with st.spinner("搜索相关论文..."):
+            for rnd in range(max_rounds):
+                engine = SearchEngine()
+                round_results = asyncio.run(engine.search(topic_text, limit=200, source="auto"))
+                if round_results:
+                    candidates.extend(round_results)
+                    all_rounds += 1
+                    st.toast(f"第{rnd+1}轮搜索：{len(round_results)}篇")
 
         if not candidates:
             st.warning("未找到相关论文")
             return
 
-        # 用 TF-IDF 语义相似度筛选最相关的20篇论文
+        # AI 领域过滤：大批次一次过滤（100篇/组，更快）
+        with st.spinner(f"AI 筛选领域相关论文（共{len(candidates)}篇）..."):
+            batch_size = 100
+            relevant_indices = set()
+            for batch_start in range(0, len(candidates), batch_size):
+                batch = candidates[batch_start:batch_start + batch_size]
+                titles_list = "\n".join(
+                    f"[{i}] {p.get('title', '')[:100]}"
+                    for i, p in enumerate(batch)
+                )
+                async def _filter(blist=titles_list):
+                    async with get_llm_client() as c:
+                        prompt = (
+                            f"研究主题：{topic_text}\n\n"
+                            f"从以下论文标题中，找出与上述主题**相关**的论文。只要内容大致相关就保留，"
+                            f"只有明显不相关的研究对象才排除。只返回相关论文的编号，JSON数组如[0,3,5]。\n\n{blist}"
+                        )
+                        result = (await c._complete([
+                            {"role": "system", "content": "只输出JSON数组如[0,3,5]，不要其他内容。"},
+                            {"role": "user", "content": prompt},
+                        ], temperature=0.0)).strip()
+                        import json, re
+                        try:
+                            return set(int(n) for n in re.findall(r'\d+', result))
+                        except Exception:
+                            return set()
+                try:
+                    batch_relevant = asyncio.run(_filter())
+                    relevant_indices.update(batch_relevant)
+                except Exception:
+                    relevant_indices.update(range(len(batch)))
+
+            filtered = [p for i, p in enumerate(candidates) if i in relevant_indices]
+            n_filtered = len(filtered)
+            st.toast(f"AI筛选：{len(candidates)}篇 → {n_filtered}篇相关")
+
+        if not filtered:
+            st.warning("未找到领域相关的论文")
+            return
+
+        candidates = filtered
+
+        # TF-IDF 语义排序 + 取前30篇
         with st.spinner("计算语义相关性..."):
-            # Build text corpus: topic + all paper titles/abstracts
             texts = [topic_text] + [f"{p.get('title', '')} {(p.get('abstract') or '')[:500]}" for p in candidates]
             try:
                 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -782,19 +833,18 @@ def render_consensus():
                 tfidf = vectorizer.fit_transform(texts)
                 sims = cosine_similarity(tfidf[0:1], tfidf[1:])[0]
             except ImportError:
-                # Fallback: simple keyword overlap
                 t_terms = set(topic_text.lower().split())
-                sims = []
-                for p in candidates:
-                    t = f"{p.get('title','')} {(p.get('abstract') or '')}".lower()
-                    sims.append(sum(1 for term in t_terms if term in t) / max(1, len(t_terms)))
-
+                sims = [
+                    sum(1 for term in t_terms if term in f"{p.get('title','')} {(p.get('abstract') or '')}".lower())
+                    / max(1, len(t_terms))
+                    for p in candidates
+                ]
             for i, p in enumerate(candidates):
                 p["_sim"] = float(sims[i]) if i < len(sims) else 0
             candidates.sort(key=lambda p: p.get("_sim", 0), reverse=True)
 
         papers = candidates[:30]
-        st.info(f"从 {len(candidates)} 篇中筛选出 {len(papers)} 篇高相关论文")
+        st.info(f"共搜索 {all_rounds} 轮，从 {len(candidates)} 篇相关论文中选取了 {len(papers)} 篇")
 
         with st.spinner("AI 共识分析中..."):
             paper_list = "\n".join(f"[{i+1}] {p.get('title','')} ({p.get('year','')})" for i, p in enumerate(papers))
@@ -831,14 +881,14 @@ def render_consensus():
                     ])
             analysis = asyncio.run(_analyze())
 
-        # Extract score
+        # Extract score (take the LAST number on the consensus line, not the section number)
         import re
         score = 50
         for line in analysis.split("\n"):
-            if "共识度" in line or "评分" in line or "score" in line.lower():
+            if "共识度评分" in line or ("共识度" in line and re.search(r'\d+', line)):
                 nums = re.findall(r'\d+', line)
                 if nums:
-                    score = min(100, max(0, int(nums[0])))
+                    score = min(100, max(0, int(nums[-1])))  # LAST number, not first
                     break
 
         st.markdown("---")

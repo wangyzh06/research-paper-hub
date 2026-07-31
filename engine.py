@@ -830,14 +830,15 @@ class LLMClient:
                 r.raise_for_status()
                 return r.json()["content"][0]["text"].strip()
             else:
-                # OpenAI-compatible format
+                # OpenAI-compatible format — use full URL to avoid base_url path issues
+                endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
                 payload = {
                     "model": self.model,
                     "messages": messages,
                     "temperature": temperature,
                     "max_tokens": 4096,
                 }
-                r = await client.post("/chat/completions", json=payload)
+                r = await client.post(endpoint, json=payload)
                 r.raise_for_status()
                 return r.json()["choices"][0]["message"]["content"].strip()
         except Exception as e:
