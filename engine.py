@@ -15,6 +15,16 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Mapped, mapped_column
 logger = logging.getLogger(__name__)
 load_dotenv()
 
+
+def _httpx_timeout_types() -> tuple[type[BaseException], ...]:
+    names = ("TimeoutException", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout")
+    return tuple(
+        error_type
+        for name in names
+        if isinstance((error_type := getattr(httpx, name, None)), type)
+        and issubclass(error_type, BaseException)
+    )
+
 # ============================================================
 # Config
 # ============================================================
@@ -556,10 +566,65 @@ def timeline_analysis(papers: list[dict]) -> dict:
 # ============================================================
 # OpenAlex Client
 # ============================================================
+@dataclass(frozen=True)
+class SourceError:
+    category: str
+    status_code: int | None
+    retryable: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class SourceBatch:
+    source: str
+    papers: tuple[dict, ...]
+    total: int = 0
+    error: SourceError | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+def _source_error(error: Exception) -> SourceError:
+    status_code = None
+    http_status_error = getattr(httpx, "HTTPStatusError", ())
+    timeout_errors = _httpx_timeout_types()
+    if http_status_error and isinstance(error, http_status_error):
+        status_code = error.response.status_code
+        if status_code in {401, 403}:
+            category = "authentication"
+        elif status_code == 429:
+            category = "rate_limit"
+        else:
+            category = "http"
+    elif timeout_errors and isinstance(error, timeout_errors):
+        category = "timeout"
+    elif isinstance(error, (ValueError, KeyError, TypeError, ET.ParseError)):
+        category = "response_parsing"
+    else:
+        category = "request"
+    retryable = category in {"timeout", "rate_limit"} or bool(
+        status_code and status_code >= 500
+    )
+    return SourceError(category, status_code, retryable, str(error)[:240])
+
+
+def normalize_doi(value: str | None) -> str:
+    doi = (value or "").strip().casefold()
+    doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi)
+    doi = re.sub(r"^doi:\s*", "", doi)
+    return doi.strip()
+
+
 def _flatten_abstract(inverted_index: dict | None) -> str | None:
     if not inverted_index:
         return None
-    words = sorted((pos[0], word) for word, pos in inverted_index.items() if pos)
+    words = sorted(
+        (position, word)
+        for word, positions in inverted_index.items()
+        for position in positions
+    )
     return " ".join(w for _, w in words)
 
 
@@ -576,7 +641,8 @@ class OpenAlexClient:
     async def __aexit__(self, *args):
         await self.client.aclose()
 
-    async def search(self, query: str, limit: int = 20, page: int = 1) -> dict:
+    async def search(self, query: str, limit: int = 20, page: int = 1,
+                     offset: int = 0) -> SourceBatch:
         try:
             r = await self.client.get("/works", params={"search": query, "per_page": limit, "page": page})
             r.raise_for_status()
@@ -585,20 +651,25 @@ class OpenAlexClient:
             for w in data.get("results", []):
                 authors = [{"name": a.get("author", {}).get("display_name", "")}
                           for a in w.get("authorships", [])]
+                openalex_id = w.get("id", "").split("/")[-1]
                 results.append({
-                    "id": w.get("id", "").split("/")[-1],
+                    "id": openalex_id,
+                    "source": "openalex",
                     "title": w.get("title", ""),
-                    "abstract": _flatten_abstract(w.get("abstract_inverted_index")),
+                    "abstract": _flatten_abstract(w.get("abstract_inverted_index")) or "",
                     "year": w.get("publication_year"),
                     "citation_count": w.get("cited_by_count", 0),
                     "venue": ((w.get("primary_location") or {}).get("source") or {}).get("display_name"),
                     "authors": authors,
-                    "doi": w.get("doi"),
+                    "doi": normalize_doi(w.get("doi")),
                     "url": w.get("id"),
+                    "openalex_id": openalex_id,
                 })
-            return {"results": results, "total": data.get("meta", {}).get("count", 0)}
-        except Exception:
-            return {"results": [], "total": 0}
+            return SourceBatch(
+                "openalex", tuple(results), data.get("meta", {}).get("count", 0), None
+            )
+        except Exception as error:
+            return SourceBatch("openalex", (), 0, _source_error(error))
 
     async def get_work(self, work_id: str) -> dict | None:
         try:
@@ -664,6 +735,29 @@ class OpenAlexClient:
 _PAPER_FIELDS = "title,authors,year,abstract,citationCount,externalIds,url,publicationVenue"
 
 
+def normalize_semantic_paper(raw: dict) -> dict:
+    paper_id = raw.get("paperId", "")
+    external_ids = raw.get("externalIds") or {}
+    publication_venue = raw.get("publicationVenue") or {}
+    doi = normalize_doi(external_ids.get("DOI"))
+    return {
+        "id": paper_id,
+        "source": "semantic_scholar",
+        "title": raw.get("title", "") or "",
+        "abstract": raw.get("abstract", "") or "",
+        "year": raw.get("year"),
+        "citation_count": raw.get("citationCount", 0) or 0,
+        "venue": publication_venue.get("name", "") or "",
+        "authors": [
+            {"name": author.get("name", "")}
+            for author in (raw.get("authors") or [])
+        ],
+        "doi": doi,
+        "url": raw.get("url", "") or "",
+        "semantic_id": paper_id,
+    }
+
+
 class SemanticScholarClient:
     def __init__(self):
         headers = {"Accept": "application/json"}
@@ -677,14 +771,16 @@ class SemanticScholarClient:
     async def __aexit__(self, *args):
         await self.client.aclose()
 
-    async def search(self, query: str, limit: int = 20, offset: int = 0) -> list[dict]:
+    async def search(self, query: str, limit: int = 20, page: int = 1,
+                     offset: int = 0) -> SourceBatch:
         try:
             r = await self.client.get("/paper/search", params={"query": query, "limit": limit, "offset": offset, "fields": _PAPER_FIELDS})
             r.raise_for_status()
             data = r.json()
-            return data.get("data", [])
-        except Exception:
-            return []
+            papers = tuple(normalize_semantic_paper(raw) for raw in data.get("data", []))
+            return SourceBatch("semantic_scholar", papers, data.get("total", len(papers)), None)
+        except Exception as error:
+            return SourceBatch("semantic_scholar", (), 0, _source_error(error))
 
     async def get_paper(self, paper_id: str) -> dict | None:
         try:
@@ -791,9 +887,11 @@ class LLMRequestError(RuntimeError):
 
 
 def _llm_error_category(error: Exception) -> str:
-    if isinstance(error, httpx.TimeoutException):
+    timeout_errors = _httpx_timeout_types()
+    http_status_error = getattr(httpx, "HTTPStatusError", ())
+    if timeout_errors and isinstance(error, timeout_errors):
         return "timeout"
-    if isinstance(error, httpx.HTTPStatusError):
+    if http_status_error and isinstance(error, http_status_error):
         status = error.response.status_code
         if status in {401, 403}:
             return "authentication"
@@ -1044,11 +1142,14 @@ class ArxivClient:
     async def __aexit__(self, *args):
         await self.client.aclose()
 
-    async def search(self, query: str, max_results: int = 30) -> list[dict]:
+    async def search(self, query: str, limit: int = 20, page: int = 1,
+                     offset: int = 0, max_results: int | None = None) -> SourceBatch:
         try:
+            result_limit = max_results or limit
+            start = offset or max(0, page - 1) * result_limit
             r = await self.client.get("/query", params={
                 "search_query": f"all:{query}",
-                "start": 0, "max_results": max_results,
+                "start": start, "max_results": result_limit,
                 "sortBy": "relevance",
             })
             r.raise_for_status()
@@ -1081,10 +1182,12 @@ class ArxivClient:
                     "authors": authors,
                     "url": f"https://arxiv.org/abs/{arx_id}",
                     "source": "arxiv",
+                    "doi": "",
+                    "arxiv_id": arx_id,
                 })
-            return {"results": papers, "total": len(papers)}
-        except Exception:
-            return {"results": [], "total": 0}
+            return SourceBatch("arxiv", tuple(papers), len(papers), None)
+        except Exception as error:
+            return SourceBatch("arxiv", (), 0, _source_error(error))
 
 
 import xml.etree.ElementTree as ET2
@@ -1103,22 +1206,35 @@ class CrossrefClient:
     async def __aenter__(self): return self
     async def __aexit__(self, *args): await self.client.aclose()
 
-    async def search(self, query: str, limit: int = 20) -> dict:
+    async def search(self, query: str, limit: int = 20, page: int = 1,
+                     offset: int = 0) -> SourceBatch:
         try:
-            r = await self.client.get("/works", params={"query": query, "rows": min(limit, 100)})
+            r = await self.client.get("/works", params={
+                "query": query,
+                "rows": min(limit, 100),
+                "offset": offset or max(0, page - 1) * min(limit, 100),
+            })
             r.raise_for_status()
             data = r.json()
             items = data.get("message", {}).get("items", [])
             results = []
             for w in items:
-                doi = w.get("DOI", "")
-                created = w.get("created", {}) or {}
-                date_parts = created.get("date-parts", [[None]]) or [[None]]
+                doi = normalize_doi(w.get("DOI", ""))
+                publication = (
+                    w.get("published")
+                    or w.get("published-print")
+                    or w.get("published-online")
+                    or w.get("issued")
+                    or w.get("created")
+                    or {}
+                )
+                date_parts = publication.get("date-parts", [[None]]) or [[None]]
                 year = (date_parts[0] or [None])[0] if date_parts else None
                 authors = [{"name": f"{(a.get('given',''))} {(a.get('family',''))}".strip()}
                           for a in w.get("author", [])]
                 results.append({
                     "id": doi,
+                    "source": "crossref",
                     "title": (w.get("title") or [""])[0],
                     "abstract": w.get("abstract", ""),
                     "year": year,
@@ -1128,14 +1244,38 @@ class CrossrefClient:
                     "doi": doi,
                     "url": f"https://doi.org/{doi}" if doi else "",
                 })
-            return {"results": results, "total": data.get("message", {}).get("total-results", 0)}
-        except Exception:
-            return {"results": [], "total": 0}
+            return SourceBatch(
+                "crossref", tuple(results), data.get("message", {}).get("total-results", 0), None
+            )
+        except Exception as error:
+            return SourceBatch("crossref", (), 0, _source_error(error))
 
 
 # ============================================================
 # PubMed Client
 # ============================================================
+def normalize_pubmed_summary(pmid: str, raw: dict) -> dict:
+    publication = raw.get("pubdate", "") or ""
+    match = re.search(r"\b(19|20)\d{2}\b", publication)
+    elocation = raw.get("elocationid", "") or ""
+    return {
+        "id": f"pmid:{pmid}",
+        "source": "pubmed",
+        "title": raw.get("title", "") or "",
+        "abstract": "",
+        "year": int(match.group(0)) if match else None,
+        "citation_count": 0,
+        "venue": raw.get("source", "") or "",
+        "authors": [
+            {"name": author.get("name", "")}
+            for author in (raw.get("authors") or [])
+        ],
+        "doi": normalize_doi(elocation) if "doi" in elocation.casefold() else "",
+        "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+        "pmid": pmid,
+    }
+
+
 class PubMedClient:
     def __init__(self):
         self.client = httpx.AsyncClient(
@@ -1146,17 +1286,19 @@ class PubMedClient:
     async def __aenter__(self): return self
     async def __aexit__(self, *args): await self.client.aclose()
 
-    async def search(self, query: str, limit: int = 20) -> dict:
+    async def search(self, query: str, limit: int = 20, page: int = 1,
+                     offset: int = 0) -> SourceBatch:
         try:
             # Step 1: Search for PubMed IDs
             r = await self.client.get("/esearch.fcgi", params={
                 "db": "pubmed", "term": query, "retmax": min(limit, 100),
+                "retstart": offset or max(0, page - 1) * min(limit, 100),
                 "retmode": "json", "sort": "relevance",
             })
             r.raise_for_status()
             id_list = r.json().get("esearchresult", {}).get("idlist", [])
             if not id_list:
-                return {"results": [], "total": 0}
+                return SourceBatch("pubmed", (), 0, None)
 
             # Step 2: Fetch summaries
             r2 = await self.client.get("/esummary.fcgi", params={
@@ -1164,27 +1306,14 @@ class PubMedClient:
             })
             r2.raise_for_status()
             result_data = r2.json().get("result", {})
-            results = []
-            for pid in id_list:
-                info = result_data.get(pid, {})
-                if not info:
-                    continue
-                authors = [{"name": a.get("name", "")}
-                          for a in info.get("authors", [])]
-                results.append({
-                    "id": pid,
-                    "title": info.get("title", ""),
-                    "abstract": info.get("elocationid", ""),
-                    "year": int(info.get("pubdate", "2020")[:4]) if info.get("pubdate") else None,
-                    "citation_count": 0,
-                    "venue": info.get("source", ""),
-                    "authors": authors,
-                    "doi": info.get("elocationid", "").replace("doi: ", "") if "doi" in info.get("elocationid", "") else "",
-                    "url": f"https://pubmed.ncbi.nlm.nih.gov/{pid}/",
-                })
-            return {"results": results, "total": len(results)}
-        except Exception:
-            return {"results": [], "total": 0}
+            results = tuple(
+                normalize_pubmed_summary(pid, result_data.get(pid, {}))
+                for pid in id_list
+                if result_data.get(pid)
+            )
+            return SourceBatch("pubmed", results, len(results), None)
+        except Exception as error:
+            return SourceBatch("pubmed", (), 0, _source_error(error))
 
 
 # ============================================================
@@ -1204,6 +1333,23 @@ class QueryPlan:
     translation_used: bool = False
     ai_error: str | None = None
     kind: str = "topic"
+
+
+@dataclass(frozen=True)
+class SearchResponse:
+    papers: tuple[dict, ...]
+    query_plan: QueryPlan
+    sources: tuple[SourceBatch, ...]
+
+    @property
+    def partial(self) -> bool:
+        return any(not batch.ok for batch in self.sources) and any(
+            batch.ok for batch in self.sources
+        )
+
+    @property
+    def all_failed(self) -> bool:
+        return bool(self.sources) and all(not batch.ok for batch in self.sources)
 
 
 def _query_kind(query: str) -> str:
