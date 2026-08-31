@@ -7,6 +7,7 @@ from engine import (
     create_tag, get_all_tags, delete_tag, add_tag_to_paper, remove_tag_from_paper, get_paper_tags,
     OpenAlexClient, LLMClient, DeepSeekClient, PDFProcessor, SearchEngine,
     SEMANTIC_SCHOLAR_API_KEY, DEEPSEEK_API_KEY, LLM_PROVIDERS,
+    DEFAULT_LLM_MODEL, DEFAULT_LLM_PROVIDER,
 )
 
 st.set_page_config(page_title="ResearchPaperHub", page_icon="🎓", layout="wide",
@@ -47,7 +48,7 @@ def navigate(page: str):
 
 def get_llm_client():
     """Create LLMClient with current session settings (secrets > session state > env)."""
-    provider = st.session_state.get("llm_provider", "deepseek")
+    provider = st.session_state.get("llm_provider", DEFAULT_LLM_PROVIDER)
     model = st.session_state.get("llm_model", "")
     api_key = st.session_state.get("llm_api_key", "")
 
@@ -1199,9 +1200,9 @@ def render_settings():
 
     # Initialize session state for LLM settings
     if "llm_provider" not in st.session_state:
-        st.session_state.llm_provider = "deepseek"
+        st.session_state.llm_provider = DEFAULT_LLM_PROVIDER
     if "llm_model" not in st.session_state:
-        st.session_state.llm_model = ""
+        st.session_state.llm_model = DEFAULT_LLM_MODEL
     if "llm_api_key" not in st.session_state:
         st.session_state.llm_api_key = ""
 

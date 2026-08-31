@@ -1,5 +1,7 @@
 import os
 import logging
+import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,6 +29,8 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = "deepseek-chat"
 SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
 OPENALEX_EMAIL = os.getenv("OPENALEX_EMAIL", "")
+DEFAULT_LLM_PROVIDER = "glm"
+DEFAULT_LLM_MODEL = "glm-4.7-flash"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 CHUNK_SIZE = 800
@@ -754,8 +758,8 @@ LLM_PROVIDERS = {
     "glm": {
         "name": "智谱清言 (GLM)",
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "models": ["glm-4.7-flash", "glm-4-plus", "glm-4-flash", "glm-4-long"],
-        "default_model": "glm-4.7-flash",
+        "models": [DEFAULT_LLM_MODEL, "glm-4.7"],
+        "default_model": DEFAULT_LLM_MODEL,
         "env_key": "ZHIPUAI_API_KEY",
     },
     "ollama": {
@@ -768,13 +772,46 @@ LLM_PROVIDERS = {
 }
 
 
+@dataclass(frozen=True)
+class LLMConfig:
+    provider: str
+    model: str
+    api_key: str = ""
+
+    @classmethod
+    def default(cls) -> "LLMConfig":
+        return cls(DEFAULT_LLM_PROVIDER, DEFAULT_LLM_MODEL, "")
+
+
+class LLMRequestError(RuntimeError):
+    def __init__(self, provider: str, category: str, detail: str):
+        super().__init__(detail)
+        self.provider = provider
+        self.category = category
+
+
+def _llm_error_category(error: Exception) -> str:
+    if isinstance(error, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(error, httpx.HTTPStatusError):
+        status = error.response.status_code
+        if status in {401, 403}:
+            return "authentication"
+        if status == 429:
+            return "rate_limit"
+        return "http"
+    if isinstance(error, (KeyError, ValueError, TypeError)):
+        return "response_parsing"
+    return "request"
+
+
 # ============================================================
 # Generic LLM Client
 # ============================================================
 class LLMClient:
-    def __init__(self, provider: str = "deepseek", api_key: str = "", model: str = ""):
-        cfg = LLM_PROVIDERS.get(provider, LLM_PROVIDERS["deepseek"])
-        self.provider = provider
+    def __init__(self, provider: str = DEFAULT_LLM_PROVIDER, api_key: str = "", model: str = ""):
+        cfg = LLM_PROVIDERS.get(provider, LLM_PROVIDERS[DEFAULT_LLM_PROVIDER])
+        self.provider = provider if provider in LLM_PROVIDERS else DEFAULT_LLM_PROVIDER
         self.model = model or cfg["default_model"]
         self.base_url = cfg["base_url"]
         self.api_format = cfg.get("api_format", "openai")
@@ -803,21 +840,25 @@ class LLMClient:
         return self
 
     async def __aexit__(self, *args):
+        await self.aclose()
+
+    async def aclose(self):
         if self._client:
             await self._client.aclose()
+            self._client = None
 
-    async def _complete(self, messages: list[dict], temperature: float = 0.3) -> str:
+    async def complete_strict(self, messages: list[dict], temperature: float = 0.3,
+                              response_format: dict | None = None) -> str:
         client = self._get_client()
         try:
             if self.api_format == "anthropic":
-                # Anthropic API format
                 system_msg = ""
                 user_messages = []
-                for m in messages:
-                    if m["role"] == "system":
-                        system_msg = m["content"]
+                for message in messages:
+                    if message["role"] == "system":
+                        system_msg = message["content"]
                     else:
-                        user_messages.append(m)
+                        user_messages.append(message)
                 payload = {
                     "model": self.model,
                     "max_tokens": 4096,
@@ -826,23 +867,36 @@ class LLMClient:
                 }
                 if system_msg:
                     payload["system"] = system_msg
-                r = await client.post("/messages", json=payload)
-                r.raise_for_status()
-                return r.json()["content"][0]["text"].strip()
-            else:
-                # OpenAI-compatible format — use full URL to avoid base_url path issues
-                endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
-                payload = {
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "max_tokens": 4096,
-                }
-                r = await client.post(endpoint, json=payload)
-                r.raise_for_status()
-                return r.json()["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            return f"[AI 调用失败：{e}]"
+                response = await client.post("/messages", json=payload)
+                response.raise_for_status()
+                return response.json()["content"][0]["text"].strip()
+
+            endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": 4096,
+            }
+            if response_format:
+                payload["response_format"] = response_format
+            response = await client.post(endpoint, json=payload)
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"].strip()
+        except LLMRequestError:
+            raise
+        except Exception as error:
+            raise LLMRequestError(
+                self.provider,
+                _llm_error_category(error),
+                str(error),
+            ) from error
+
+    async def _complete(self, messages: list[dict], temperature: float = 0.3) -> str:
+        try:
+            return await self.complete_strict(messages, temperature)
+        except LLMRequestError as error:
+            return f"[AI 调用失败：{error}]"
 
     async def summarize(self, text: str) -> str:
         prompt = ("请用中文总结以下学术论文的核心内容，按以下格式输出：\n"
@@ -887,7 +941,7 @@ class LLMClient:
             "输出纯英文关键词，用空格分隔，不要任何解释。\n\n"
             f"中文查询：{chinese_query}"
         )
-        return (await self._complete([
+        return (await self.complete_strict([
             {"role": "system", "content": "你是学术搜索翻译助手，只输出翻译后的英文关键词。"},
             {"role": "user", "content": prompt},
         ], temperature=0.1)).strip()
@@ -899,7 +953,7 @@ class LLMClient:
             "输出纯英文关键词，不要编号、不要解释、不要用 markdown。\n\n"
             f"查询：{query}"
         )
-        result = await self._complete([
+        result = await self.complete_strict([
             {"role": "system", "content": "你是学术搜索专家，只输出搜索关键词，每行一个。"},
             {"role": "user", "content": prompt},
         ], temperature=0.3)
@@ -1143,13 +1197,111 @@ def _contains_chinese(text: str) -> bool:
     return bool(_re.search(r'[\u4e00-\u9fff]', text))
 
 
+@dataclass(frozen=True)
+class QueryPlan:
+    original: str
+    variants: tuple[str, ...]
+    translation_used: bool = False
+    ai_error: str | None = None
+    kind: str = "topic"
+
+
+def _query_kind(query: str) -> str:
+    value = query.strip()
+    lowered = value.lower()
+    if re.fullmatch(r"(?:https?://(?:dx\.)?doi\.org/|doi:\s*)?10\.\d{4,9}/\S+", lowered):
+        return "doi"
+    if re.fullmatch(r"(?:arxiv:\s*)?\d{4}\.\d{4,5}(?:v\d+)?", lowered):
+        return "arxiv"
+    if re.fullmatch(r"pmid:\s*\d+", lowered):
+        return "pmid"
+    if re.fullmatch(r"W\d+", value, re.IGNORECASE):
+        return "openalex"
+    if len(value.split()) > 8:
+        return "title"
+    return "topic"
+
+
+def _clean_query_variant(value: str) -> str | None:
+    cleaned = " ".join((value or "").strip().split())
+    if not cleaned or len(cleaned) > 200:
+        return None
+    if "AI 调用失败" in cleaned or cleaned.startswith("["):
+        return None
+    if re.match(r"^(?:\d+[.)]|[-*#])\s*", cleaned):
+        return None
+    return cleaned
+
+
+class QueryPlanner:
+    def __init__(self, llm_factory):
+        self.llm_factory = llm_factory
+
+    async def build(self, query: str) -> QueryPlan:
+        original = " ".join(query.strip().split())
+        if not original:
+            return QueryPlan("", ())
+
+        variants = [original]
+        translation_used = False
+        ai_error = None
+        client = self.llm_factory()
+        effective = original
+        try:
+            if _contains_chinese(original):
+                translated = _clean_query_variant(await client.translate_query(original))
+                if translated and translated.casefold() != original.casefold():
+                    variants.append(translated)
+                    effective = translated
+                    translation_used = True
+            for candidate in await client.expand_query(effective):
+                cleaned = _clean_query_variant(candidate)
+                if cleaned:
+                    variants.append(cleaned)
+        except LLMRequestError as error:
+            ai_error = error.category
+        except Exception:
+            ai_error = "request"
+        finally:
+            close = getattr(client, "aclose", None)
+            if close:
+                await close()
+
+        unique = []
+        seen = set()
+        for variant in variants:
+            key = variant.casefold()
+            if key not in seen:
+                seen.add(key)
+                unique.append(variant)
+            if len(unique) == 4:
+                break
+        return QueryPlan(original, tuple(unique), translation_used, ai_error, _query_kind(original))
+
+
 class SearchEngine:
-    def __init__(self):
+    def __init__(self, llm_config: LLMConfig | None = None,
+                 clients: dict[str, object] | None = None, query_planner=None):
+        self.llm_config = llm_config or LLMConfig.default()
+        clients = clients or {}
         self._oa = None  # OpenAlex
         self._arx = None # arXiv
         self._ss = None  # Semantic Scholar
         self._cr = None  # Crossref
         self._pm = None  # PubMed
+        self._oa = clients.get("openalex")
+        self._arx = clients.get("arxiv")
+        self._ss = clients.get("semantic_scholar")
+        self._cr = clients.get("crossref")
+        self._pm = clients.get("pubmed")
+        self.query_planner = query_planner or QueryPlanner(self._new_llm_client)
+
+    def _new_llm_client(self):
+        return LLMClient(
+            provider=self.llm_config.provider,
+            api_key=self.llm_config.api_key,
+            model=self.llm_config.model,
+        )
 
     async def _ensure_clients(self):
         if self._oa is None: self._oa = OpenAlexClient()
@@ -1160,14 +1312,14 @@ class SearchEngine:
 
     async def _translate_to_english(self, chinese_query: str) -> str:
         try:
-            async with LLMClient() as c:
+            async with self._new_llm_client() as c:
                 return await c.translate_query(chinese_query)
         except Exception:
             return chinese_query
 
     async def _expand_query(self, query: str) -> list[str]:
         try:
-            async with LLMClient() as c:
+            async with self._new_llm_client() as c:
                 return await c.expand_query(query)
         except Exception:
             return [query]
