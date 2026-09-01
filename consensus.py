@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+import json
+from dataclasses import asdict, dataclass, replace
 from typing import Sequence
 
 
@@ -159,3 +161,235 @@ def calculate_consensus(items: Sequence[EvidenceItem]) -> ConsensusScore:
         weighted_mixed=mixed_weight,
         raw_counts=raw_counts,
     )
+
+
+@dataclass(frozen=True)
+class ConsensusAnalysis:
+    evidence: tuple[EvidenceItem, ...]
+    score: ConsensusScore
+    narrative: str
+
+
+class ConsensusAnalyzer:
+    """Use an LLM for bounded evidence extraction, never for score calculation."""
+
+    def __init__(self, llm_factory, max_concurrency: int = 4):
+        self.llm_factory = llm_factory
+        self.max_concurrency = max(1, max_concurrency)
+
+    @staticmethod
+    def _unavailable(paper: dict, reason: str) -> EvidenceItem:
+        return EvidenceItem(
+            paper_id=str(paper.get("id") or paper.get("doi") or paper.get("title") or ""),
+            title=paper.get("title") or "Untitled",
+            eligible=False,
+            exclusion_reason=reason,
+            study_type="unknown",
+            stance="not_applicable",
+            claim="",
+            excerpt="",
+            quality="unknown",
+            directness=0.0,
+            confidence=0.0,
+            independence_factor=1.0,
+            limitations=("abstract_only", "extraction_failed"),
+        )
+
+    @staticmethod
+    async def _close_client(client) -> None:
+        close = getattr(client, "aclose", None)
+        if close:
+            try:
+                await close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _text(payload: dict, key: str, default: str = "not reported") -> str:
+        value = payload.get(key)
+        if value is None or value == "":
+            return default
+        return str(value).strip() or default
+
+    def _parse_evidence(self, raw: str, paper: dict) -> EvidenceItem:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("evidence response must be a JSON object")
+        eligible = payload.get("eligible", False)
+        if not isinstance(eligible, bool):
+            raise ValueError("eligible must be boolean")
+
+        study_type = self._text(payload, "study_type", "unknown").casefold()
+        stance = self._text(payload, "stance", "uncertain").casefold()
+        quality = self._text(payload, "quality", "unknown").casefold()
+        if study_type not in STUDY_WEIGHTS:
+            raise ValueError("invalid study_type")
+        if stance not in STANCE_VALUES:
+            raise ValueError("invalid stance")
+        if quality not in QUALITY_WEIGHTS:
+            raise ValueError("invalid quality")
+
+        limitations_value = payload.get("limitations", [])
+        if not isinstance(limitations_value, list):
+            raise ValueError("limitations must be an array")
+        limitations = [str(value).strip() for value in limitations_value if str(value).strip()]
+        if "abstract_only" not in limitations:
+            limitations.append("abstract_only")
+
+        abstract = paper.get("abstract") or ""
+        excerpt = self._text(payload, "excerpt", "")
+        if excerpt and excerpt not in abstract:
+            excerpt = ""
+            limitations.append("untraceable_excerpt")
+
+        return EvidenceItem(
+            paper_id=str(paper.get("id") or paper.get("doi") or paper.get("title") or ""),
+            title=paper.get("title") or "Untitled",
+            eligible=eligible,
+            exclusion_reason=self._text(payload, "exclusion_reason", ""),
+            study_type=study_type,
+            stance=stance,
+            claim=self._text(payload, "claim", ""),
+            excerpt=excerpt,
+            quality=quality,
+            directness=_clamp(payload.get("directness", 0.0)),
+            confidence=_clamp(payload.get("confidence", 0.0)),
+            independence_factor=1.0,
+            limitations=tuple(dict.fromkeys(limitations)),
+            population=self._text(payload, "population"),
+            intervention=self._text(payload, "intervention"),
+            comparator=self._text(payload, "comparator"),
+            outcome=self._text(payload, "outcome"),
+            effect_direction=self._text(payload, "effect_direction"),
+            sample_size=self._text(payload, "sample_size"),
+            statistical_evidence=self._text(payload, "statistical_evidence"),
+            cohort_key=self._text(payload, "cohort_key", ""),
+        )
+
+    async def extract_one(self, question: str, paper: dict) -> EvidenceItem:
+        abstract = paper.get("abstract") or ""
+        if not abstract.strip():
+            return self._unavailable(paper, "no abstract available")
+
+        schema = (
+            "Return one JSON object with keys: eligible (boolean), exclusion_reason, "
+            "study_type (experimental|observational|simulation|theory|review|"
+            "systematic_review|meta_analysis|commentary|unknown), population, "
+            "intervention, comparator, outcome, stance "
+            "(support|oppose|mixed|uncertain|not_applicable), claim, effect_direction, "
+            "sample_size, statistical_evidence, quality (high|medium|low|unknown), "
+            "directness (0..1), confidence (0..1), excerpt, limitations (array), "
+            "and cohort_key. Use 'not reported' for facts absent from the abstract. "
+            "The excerpt must be copied exactly from the supplied abstract."
+        )
+        messages = [
+            {"role": "system", "content": "Extract evidence conservatively from abstracts only. " + schema},
+            {
+                "role": "user",
+                "content": (
+                    f"Research question: {question}\nTitle: {paper.get('title', '')}\n"
+                    f"Abstract: {abstract}"
+                ),
+            },
+        ]
+        client = self.llm_factory()
+        last_error = "invalid structured response"
+        invalid_response = ""
+        try:
+            for attempt in range(2):
+                request_messages = messages
+                if attempt:
+                    request_messages = [
+                        {"role": "system", "content": "Repair the response as strict JSON. " + schema},
+                        {"role": "user", "content": f"Invalid response:\n{invalid_response}"},
+                    ]
+                try:
+                    raw = await client.complete_strict(
+                        request_messages,
+                        temperature=0,
+                        response_format={"type": "json_object"},
+                    )
+                    invalid_response = str(raw)
+                    return self._parse_evidence(invalid_response, paper)
+                except Exception as error:
+                    last_error = f"evidence extraction failed: {type(error).__name__}"
+            return self._unavailable(paper, last_error)
+        finally:
+            await self._close_client(client)
+
+    @staticmethod
+    def _apply_duplicate_cohort_weights(
+        evidence: Sequence[EvidenceItem],
+    ) -> tuple[EvidenceItem, ...]:
+        seen = set()
+        adjusted = []
+        for item in evidence:
+            key = item.cohort_key.strip().casefold()
+            if key and key in seen:
+                limitations = tuple(dict.fromkeys((*item.limitations, "duplicate_cohort")))
+                item = replace(item, independence_factor=0.25, limitations=limitations)
+            elif key:
+                seen.add(key)
+            adjusted.append(item)
+        return tuple(adjusted)
+
+    @staticmethod
+    def _fallback_narrative(score: ConsensusScore) -> str:
+        if score.score is None:
+            return "现有摘要未提供足够的方向性证据，无法计算共识度。"
+        return (
+            f"主要证据方向为 {score.direction}；方向一致率为 "
+            f"{score.directional_agreement:.1%}，证据确定性为 "
+            f"{score.evidence_certainty:.1%}。共识分为 {score.score}/100。"
+        )
+
+    async def analyze(self, question: str,
+                      papers: Sequence[dict]) -> ConsensusAnalysis:
+        semaphore = asyncio.Semaphore(self.max_concurrency)
+
+        async def bounded(paper):
+            async with semaphore:
+                return await self.extract_one(question, paper)
+
+        extracted = await asyncio.gather(*(bounded(paper) for paper in papers))
+        evidence = self._apply_duplicate_cohort_weights(extracted)
+        score = calculate_consensus(evidence)
+        fixed_values = asdict(score)
+        evidence_summary = [
+            {
+                "title": item.title,
+                "eligible": item.eligible,
+                "exclusion_reason": item.exclusion_reason,
+                "study_type": item.study_type,
+                "stance": item.stance,
+                "claim": item.claim,
+                "quality": item.quality,
+                "limitations": item.limitations,
+            }
+            for item in evidence
+        ]
+        prompt = (
+            "Write a concise Chinese evidence synthesis. The following calculated "
+            "values are immutable: do not recalculate, replace, or infer another score. "
+            "State the abstract-only limitation and distinguish unavailable facts.\n"
+            + json.dumps(fixed_values, ensure_ascii=False, sort_keys=True)
+            + "\nExtracted evidence:\n"
+            + json.dumps(evidence_summary, ensure_ascii=False)
+        )
+        narrative = self._fallback_narrative(score)
+        client = self.llm_factory()
+        try:
+            generated = await client.complete_strict(
+                [
+                    {"role": "system", "content": "Synthesize evidence without changing supplied metrics."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+            )
+            if str(generated).strip():
+                narrative = str(generated).strip()
+        except Exception:
+            pass
+        finally:
+            await self._close_client(client)
+        return ConsensusAnalysis(evidence, score, narrative)
