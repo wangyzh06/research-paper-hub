@@ -37,8 +37,10 @@ class FakeResponse:
 class SequenceHttpClient:
     def __init__(self, responses):
         self.responses = iter(responses)
+        self.calls = []
 
     async def get(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
         response = next(self.responses)
         if isinstance(response, Exception):
             raise response
@@ -46,6 +48,12 @@ class SequenceHttpClient:
 
     async def aclose(self):
         return None
+
+
+class LegacyStatusError(Exception):
+    def __init__(self, status_code):
+        self.response = type("Response", (), {"status_code": status_code})()
+        super().__init__(f"HTTP {status_code}")
 
 
 def test_openalex_abstract_reconstruction_keeps_repeated_tokens():
@@ -153,6 +161,19 @@ async def test_semantic_scholar_search_normalizes_papers_in_batch():
     batch = await client.search("paper")
     assert batch.source == "semantic_scholar"
     assert batch.papers[0]["semantic_id"] == "s2"
+    assert client.client.calls[0][0][0] == "/graph/v1/paper/search"
+
+
+@pytest.mark.asyncio
+async def test_legacy_http_status_errors_are_still_classified():
+    client = OpenAlexClient.__new__(OpenAlexClient)
+    client.client = SequenceHttpClient([LegacyStatusError(429)])
+
+    batch = await client.search("paper")
+
+    assert batch.error.category == "rate_limit"
+    assert batch.error.status_code == 429
+    assert batch.error.retryable is True
 
 
 @pytest.mark.asyncio
@@ -160,13 +181,30 @@ async def test_pubmed_search_returns_normalized_summary_batch():
     client = PubMedClient.__new__(PubMedClient)
     client.client = SequenceHttpClient(
         [
-            FakeResponse({"esearchresult": {"idlist": ["123"]}}),
+            FakeResponse({"esearchresult": {"idlist": ["123"], "count": "25"}}),
             FakeResponse({"result": {"123": {"title": "Paper", "pubdate": "2024"}}}),
+            FakeResponse(
+                {},
+                text=(
+                    "<PubmedArticleSet><PubmedArticle><MedlineCitation>"
+                    "<PMID>123</PMID><Article><Abstract>"
+                    "<AbstractText Label='RESULTS'>Treatment improved outcomes.</AbstractText>"
+                    "</Abstract></Article></MedlineCitation></PubmedArticle>"
+                    "</PubmedArticleSet>"
+                ),
+            ),
         ]
     )
     batch = await client.search("paper")
     assert batch.source == "pubmed"
     assert batch.papers[0]["id"] == "pmid:123"
+    assert batch.papers[0]["abstract"] == "RESULTS: Treatment improved outcomes."
+    assert batch.total == 25
+    assert [call[0][0] for call in client.client.calls] == [
+        "/entrez/eutils/esearch.fcgi",
+        "/entrez/eutils/esummary.fcgi",
+        "/entrez/eutils/efetch.fcgi",
+    ]
 
 
 @pytest.mark.asyncio
@@ -200,7 +238,8 @@ async def test_crossref_prefers_publication_year_over_record_creation_year():
 @pytest.mark.asyncio
 async def test_arxiv_search_returns_source_batch_with_arxiv_id():
     xml = """<?xml version="1.0" encoding="UTF-8"?>
-    <feed xmlns="http://www.w3.org/2005/Atom">
+    <feed xmlns="http://www.w3.org/2005/Atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+      <opensearch:totalResults>42</opensearch:totalResults>
       <entry>
         <id>https://arxiv.org/abs/2401.00001</id>
         <published>2024-01-01T00:00:00Z</published>
@@ -214,6 +253,8 @@ async def test_arxiv_search_returns_source_batch_with_arxiv_id():
     batch = await client.search("paper")
     assert isinstance(batch, SourceBatch)
     assert batch.papers[0]["arxiv_id"] == "2401.00001"
+    assert batch.total == 42
+    assert client.client.calls[0][0][0] == "/api/query"
 
 
 def test_search_response_distinguishes_partial_from_all_failed():

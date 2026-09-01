@@ -31,6 +31,12 @@ def build_llm_config(provider: str, model: str, api_key: str) -> LLMConfig:
     return LLMConfig(selected_provider, selected_model, (api_key or "").strip())
 
 
+def llm_secret_name(provider: str) -> str:
+    """Return the documented environment/Streamlit secret name for a provider."""
+    selected_provider = provider if provider in LLM_PROVIDERS else DEFAULT_LLM_PROVIDER
+    return LLM_PROVIDERS[selected_provider].get("env_key", "")
+
+
 def format_search_diagnostics(response: SearchResponse) -> dict:
     """Create a UI-safe summary of source health and query planning."""
     failed_sources = [batch.source for batch in response.sources if not batch.ok]

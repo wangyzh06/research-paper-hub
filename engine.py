@@ -587,11 +587,11 @@ class SourceBatch:
 
 
 def _source_error(error: Exception) -> SourceError:
-    status_code = None
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
     http_status_error = getattr(httpx, "HTTPStatusError", ())
     timeout_errors = _httpx_timeout_types()
-    if http_status_error and isinstance(error, http_status_error):
-        status_code = error.response.status_code
+    if status_code is not None or (http_status_error and isinstance(error, http_status_error)):
         if status_code in {401, 403}:
             category = "authentication"
         elif status_code == 429:
@@ -639,6 +639,9 @@ class OpenAlexClient:
         return self
 
     async def __aexit__(self, *args):
+        await self.client.aclose()
+
+    async def aclose(self):
         await self.client.aclose()
 
     async def search(self, query: str, limit: int = 20, page: int = 1,
@@ -763,7 +766,7 @@ class SemanticScholarClient:
         headers = {"Accept": "application/json"}
         if SEMANTIC_SCHOLAR_API_KEY:
             headers["x-api-key"] = SEMANTIC_SCHOLAR_API_KEY
-        self.client = httpx.AsyncClient(base_url="https://api.semanticscholar.org/graph/v1", headers=headers, timeout=10.0)
+        self.client = httpx.AsyncClient(base_url="https://api.semanticscholar.org", headers=headers, timeout=10.0)
 
     async def __aenter__(self):
         return self
@@ -771,10 +774,13 @@ class SemanticScholarClient:
     async def __aexit__(self, *args):
         await self.client.aclose()
 
+    async def aclose(self):
+        await self.client.aclose()
+
     async def search(self, query: str, limit: int = 20, page: int = 1,
                      offset: int = 0) -> SourceBatch:
         try:
-            r = await self.client.get("/paper/search", params={"query": query, "limit": limit, "offset": offset, "fields": _PAPER_FIELDS})
+            r = await self.client.get("/graph/v1/paper/search", params={"query": query, "limit": limit, "offset": offset, "fields": _PAPER_FIELDS})
             r.raise_for_status()
             data = r.json()
             papers = tuple(normalize_semantic_paper(raw) for raw in data.get("data", []))
@@ -784,7 +790,7 @@ class SemanticScholarClient:
 
     async def get_paper(self, paper_id: str) -> dict | None:
         try:
-            r = await self.client.get(f"/paper/{paper_id}", params={"fields": _PAPER_FIELDS})
+            r = await self.client.get(f"/graph/v1/paper/{paper_id}", params={"fields": _PAPER_FIELDS})
             r.raise_for_status()
             return r.json()
         except Exception:
@@ -792,7 +798,7 @@ class SemanticScholarClient:
 
     async def get_citations(self, paper_id: str, limit: int = 50) -> list[dict]:
         try:
-            r = await self.client.get(f"/paper/{paper_id}/citations", params={"limit": limit, "fields": "title,authors,year,citationCount"})
+            r = await self.client.get(f"/graph/v1/paper/{paper_id}/citations", params={"limit": limit, "fields": "title,authors,year,citationCount"})
             r.raise_for_status()
             data = r.json()
             return [e["citingPaper"] for e in data.get("data", []) if "citingPaper" in e]
@@ -801,7 +807,7 @@ class SemanticScholarClient:
 
     async def get_references(self, paper_id: str, limit: int = 50) -> list[dict]:
         try:
-            r = await self.client.get(f"/paper/{paper_id}/references", params={"limit": limit, "fields": "title,authors,year,citationCount"})
+            r = await self.client.get(f"/graph/v1/paper/{paper_id}/references", params={"limit": limit, "fields": "title,authors,year,citationCount"})
             r.raise_for_status()
             data = r.json()
             return [e["citedPaper"] for e in data.get("data", []) if "citedPaper" in e]
@@ -810,7 +816,7 @@ class SemanticScholarClient:
 
     async def get_similar(self, paper_id: str, limit: int = 10) -> list[dict]:
         try:
-            r = await self.client.get(f"/paper/{paper_id}/similar", params={"limit": limit})
+            r = await self.client.get(f"/graph/v1/paper/{paper_id}/similar", params={"limit": limit})
             r.raise_for_status()
             data = r.json()
             return data.get("papers", [])
@@ -891,8 +897,9 @@ def _llm_error_category(error: Exception) -> str:
     http_status_error = getattr(httpx, "HTTPStatusError", ())
     if timeout_errors and isinstance(error, timeout_errors):
         return "timeout"
-    if http_status_error and isinstance(error, http_status_error):
-        status = error.response.status_code
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is not None or (http_status_error and isinstance(error, http_status_error)):
         if status in {401, 403}:
             return "authentication"
         if status == 429:
@@ -1130,11 +1137,12 @@ class EmbeddingService:
 import xml.etree.ElementTree as ET
 
 _ARXIV_NS = "http://www.w3.org/2005/Atom"
+_OPENSEARCH_NS = "http://a9.com/-/spec/opensearch/1.1/"
 
 
 class ArxivClient:
     def __init__(self):
-        self.client = httpx.AsyncClient(base_url="https://export.arxiv.org/api", timeout=15.0)
+        self.client = httpx.AsyncClient(base_url="https://export.arxiv.org", timeout=15.0)
 
     async def __aenter__(self):
         return self
@@ -1142,12 +1150,15 @@ class ArxivClient:
     async def __aexit__(self, *args):
         await self.client.aclose()
 
+    async def aclose(self):
+        await self.client.aclose()
+
     async def search(self, query: str, limit: int = 20, page: int = 1,
                      offset: int = 0, max_results: int | None = None) -> SourceBatch:
         try:
             result_limit = max_results or limit
             start = offset or max(0, page - 1) * result_limit
-            r = await self.client.get("/query", params={
+            r = await self.client.get("/api/query", params={
                 "search_query": f"all:{query}",
                 "start": start, "max_results": result_limit,
                 "sortBy": "relevance",
@@ -1185,7 +1196,12 @@ class ArxivClient:
                     "doi": "",
                     "arxiv_id": arx_id,
                 })
-            return SourceBatch("arxiv", tuple(papers), len(papers), None)
+            total_element = root.find(f"{{{_OPENSEARCH_NS}}}totalResults")
+            try:
+                total = int(total_element.text) if total_element is not None else len(papers)
+            except (TypeError, ValueError):
+                total = len(papers)
+            return SourceBatch("arxiv", tuple(papers), total, None)
         except Exception as error:
             return SourceBatch("arxiv", (), 0, _source_error(error))
 
@@ -1205,6 +1221,7 @@ class CrossrefClient:
 
     async def __aenter__(self): return self
     async def __aexit__(self, *args): await self.client.aclose()
+    async def aclose(self): await self.client.aclose()
 
     async def search(self, query: str, limit: int = 20, page: int = 1,
                      offset: int = 0) -> SourceBatch:
@@ -1276,42 +1293,79 @@ def normalize_pubmed_summary(pmid: str, raw: dict) -> dict:
     }
 
 
+def _parse_pubmed_abstracts(xml_text: str) -> dict[str, str]:
+    abstracts = {}
+    root = ET.fromstring(xml_text)
+    for article in root.findall(".//PubmedArticle"):
+        pmid_element = article.find(".//MedlineCitation/PMID")
+        if pmid_element is None or not pmid_element.text:
+            continue
+        sections = []
+        for abstract_element in article.findall(".//Article/Abstract/AbstractText"):
+            text = "".join(abstract_element.itertext()).strip()
+            if not text:
+                continue
+            label = (abstract_element.get("Label") or "").strip()
+            sections.append(f"{label}: {text}" if label else text)
+        if sections:
+            abstracts[pmid_element.text.strip()] = " ".join(sections)
+    return abstracts
+
+
 class PubMedClient:
     def __init__(self):
         self.client = httpx.AsyncClient(
-            base_url="https://eutils.ncbi.nlm.nih.gov/entrez/eutils",
+            base_url="https://eutils.ncbi.nlm.nih.gov",
             timeout=15.0,
         )
 
     async def __aenter__(self): return self
     async def __aexit__(self, *args): await self.client.aclose()
+    async def aclose(self): await self.client.aclose()
 
     async def search(self, query: str, limit: int = 20, page: int = 1,
                      offset: int = 0) -> SourceBatch:
         try:
             # Step 1: Search for PubMed IDs
-            r = await self.client.get("/esearch.fcgi", params={
+            r = await self.client.get("/entrez/eutils/esearch.fcgi", params={
                 "db": "pubmed", "term": query, "retmax": min(limit, 100),
                 "retstart": offset or max(0, page - 1) * min(limit, 100),
                 "retmode": "json", "sort": "relevance",
             })
             r.raise_for_status()
-            id_list = r.json().get("esearchresult", {}).get("idlist", [])
+            search_result = r.json().get("esearchresult", {})
+            id_list = search_result.get("idlist", [])
+            try:
+                total = int(search_result.get("count", len(id_list)))
+            except (TypeError, ValueError):
+                total = len(id_list)
             if not id_list:
                 return SourceBatch("pubmed", (), 0, None)
 
             # Step 2: Fetch summaries
-            r2 = await self.client.get("/esummary.fcgi", params={
+            r2 = await self.client.get("/entrez/eutils/esummary.fcgi", params={
                 "db": "pubmed", "id": ",".join(id_list), "retmode": "json",
             })
             r2.raise_for_status()
             result_data = r2.json().get("result", {})
-            results = tuple(
+            results = [
                 normalize_pubmed_summary(pid, result_data.get(pid, {}))
                 for pid in id_list
                 if result_data.get(pid)
-            )
-            return SourceBatch("pubmed", results, len(results), None)
+            ]
+            try:
+                r3 = await self.client.get("/entrez/eutils/efetch.fcgi", params={
+                    "db": "pubmed", "id": ",".join(id_list),
+                    "retmode": "xml", "rettype": "abstract",
+                })
+                r3.raise_for_status()
+                abstracts = _parse_pubmed_abstracts(r3.text)
+                for paper in results:
+                    paper["abstract"] = abstracts.get(paper["pmid"], "")
+            except Exception:
+                # Summary search remains useful when the optional abstract fetch fails.
+                pass
+            return SourceBatch("pubmed", tuple(results), total, None)
         except Exception as error:
             return SourceBatch("pubmed", (), 0, _source_error(error))
 
@@ -1344,12 +1398,16 @@ class SearchResponse:
     @property
     def partial(self) -> bool:
         return any(not batch.ok for batch in self.sources) and any(
-            batch.ok for batch in self.sources
+            batch.ok or bool(batch.papers) for batch in self.sources
         )
 
     @property
     def all_failed(self) -> bool:
-        return bool(self.sources) and all(not batch.ok for batch in self.sources)
+        return (
+            bool(self.sources)
+            and all(not batch.ok for batch in self.sources)
+            and not any(batch.papers for batch in self.sources)
+        )
 
 
 def _query_kind(query: str) -> str:
@@ -1527,9 +1585,8 @@ class SearchEngine:
                 if isinstance(result, Exception):
                     result = SourceBatch(source_name, (), 0, _source_error(result))
                 source_calls[source_name].append(result)
-                if result.ok:
-                    for rank, paper in enumerate(result.papers, start=1):
-                        occurrences.append((source_name, variant_index, rank, paper))
+                for rank, paper in enumerate(result.papers, start=1):
+                    occurrences.append((source_name, variant_index, rank, paper))
         finally:
             await self._close_clients(selected_clients.values())
 
@@ -1667,7 +1724,7 @@ class SearchEngine:
     @staticmethod
     def _select_diverse(papers: list[dict], source_batches: tuple[SourceBatch, ...],
                         limit: int) -> list[dict]:
-        successful_sources = [batch.source for batch in source_batches if batch.ok and batch.papers]
+        successful_sources = [batch.source for batch in source_batches if batch.papers]
         if limit < len(successful_sources):
             return papers[:limit]
         selected = []

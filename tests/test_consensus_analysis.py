@@ -3,6 +3,7 @@ import json
 import pytest
 
 from consensus import ConsensusAnalyzer
+from engine import LLMRequestError
 
 
 class SequenceLLM:
@@ -134,3 +135,50 @@ async def test_narrative_receives_fixed_calculated_score():
     narrative_prompt = factory.calls[-1]["messages"][-1]["content"]
     assert '"score": 100' in narrative_prompt
     assert analysis.narrative == "Narrative based on fixed values"
+
+
+@pytest.mark.asyncio
+async def test_offline_mixed_evidence_regression_returns_literal_weighted_score():
+    def encoded(**changes):
+        return json.dumps({**VALID_DATA, **changes})
+
+    responses = [
+        encoded(stance="support", quality="high", confidence=1.0, cohort_key="c1"),
+        encoded(stance="support", quality="high", confidence=1.0, cohort_key="c1"),
+        encoded(stance="oppose", quality="medium", confidence=1.0),
+        encoded(stance="uncertain", quality="high", confidence=1.0),
+        encoded(
+            eligible=False,
+            exclusion_reason="review article",
+            study_type="review",
+            stance="support",
+            quality="high",
+            confidence=1.0,
+        ),
+        "Fixed integration narrative",
+    ]
+    papers = [{**PAPER, "id": f"mix-{i}", "title": f"Evidence {i}"} for i in range(5)]
+    analyzer = ConsensusAnalyzer(QueueFactory(responses), max_concurrency=1)
+
+    analysis = await analyzer.analyze("question", papers)
+
+    assert analysis.score.weighted_support == pytest.approx(1.25)
+    assert analysis.score.weighted_oppose == pytest.approx(0.75)
+    assert analysis.score.effective_independent_studies == pytest.approx(2.25)
+    assert analysis.score.score == 16
+    assert analysis.score.direction == "support"
+    assert analysis.evidence[4].eligible is False
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_opens_circuit_instead_of_retrying_every_paper():
+    factory = QueueFactory(
+        [LLMRequestError("glm", "rate_limit", "too many requests")]
+    )
+    analyzer = ConsensusAnalyzer(factory, max_concurrency=1)
+
+    analysis = await analyzer.analyze("question", [PAPER, {**PAPER, "id": "p2"}])
+
+    assert len(factory.calls) == 1
+    assert all(not item.eligible for item in analysis.evidence)
+    assert analysis.score.score is None

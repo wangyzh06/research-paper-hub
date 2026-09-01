@@ -3,6 +3,7 @@ from app_support import (
     build_llm_config,
     consensus_rows,
     format_search_diagnostics,
+    llm_secret_name,
     search_cache_ttl,
 )
 from consensus import ConsensusAnalysis, ConsensusScore, EvidenceItem
@@ -27,6 +28,10 @@ def test_blank_ui_configuration_uses_glm_defaults():
     assert build_llm_config("", "", "") == LLMConfig(
         "glm", "glm-4.7-flash", ""
     )
+
+
+def test_glm_uses_zhipu_secret_name():
+    assert llm_secret_name("glm") == "ZHIPUAI_API_KEY"
 
 
 def test_partial_search_diagnostics_name_failed_source():

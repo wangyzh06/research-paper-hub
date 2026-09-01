@@ -26,6 +26,14 @@ class KindLLM:
         return []
 
 
+class TranslationLLM:
+    async def translate_query(self, query):
+        return "silicon photonic modulator"
+
+    async def expand_query(self, query):
+        return ["integrated optical modulator"]
+
+
 class FakeSource:
     def __init__(self, source, pages=None, error=None):
         self.source = source
@@ -45,6 +53,25 @@ class FakeSource:
 
     async def aclose(self):
         self.closed = True
+
+
+class PartialPageSource:
+    async def search(self, query, limit=20, page=1, offset=0):
+        if page == 1:
+            return SourceBatch(
+                "openalex",
+                (paper("openalex", "first", "First page result"),),
+                2,
+            )
+        return SourceBatch(
+            "openalex",
+            (),
+            2,
+            SourceError("timeout", None, True, "second page timeout"),
+        )
+
+    async def aclose(self):
+        pass
 
 
 def paper(source, ident, title, doi="", abstract=""):
@@ -148,6 +175,21 @@ async def test_provider_pagination_requests_a_new_page():
 
 
 @pytest.mark.asyncio
+async def test_second_page_failure_keeps_first_page_results_as_partial():
+    engine = SearchEngine(
+        LLMConfig.default(),
+        clients={"openalex": PartialPageSource()},
+        query_planner=StaticPlanner(("paper",)),
+    )
+
+    response = await engine.search_with_diagnostics("paper", limit=2)
+
+    assert [result["id"] for result in response.papers] == ["first"]
+    assert response.partial is True
+    assert response.all_failed is False
+
+
+@pytest.mark.asyncio
 async def test_partial_and_total_failures_remain_distinguishable():
     timeout = SourceError("timeout", None, True, "slow")
     partial_engine = SearchEngine(
@@ -184,3 +226,45 @@ async def test_query_planner_labels_identifier_and_title_queries(query, kind):
     plan = await QueryPlanner(lambda: KindLLM()).build(query)
     assert plan.kind == kind
     assert plan.original in plan.variants
+
+
+@pytest.mark.asyncio
+async def test_offline_multisource_chinese_search_deduplicates_and_reports_partial():
+    shared_openalex = paper(
+        "openalex", "oa-shared", "Silicon photonic modulator", "10.1000/shared"
+    )
+    shared_crossref = paper(
+        "crossref",
+        "cr-shared",
+        "Silicon photonic modulator",
+        "https://doi.org/10.1000/SHARED",
+        abstract="A richer abstract",
+    )
+    timeout = SourceError("timeout", None, True, "temporary timeout")
+    clients = {
+        "openalex": FakeSource("openalex", {1: [shared_openalex]}),
+        "crossref": FakeSource("crossref", {1: [shared_crossref]}),
+        "arxiv": FakeSource(
+            "arxiv", {1: [paper("arxiv", "ax", "Integrated optical modulator")]}
+        ),
+        "pubmed": FakeSource(
+            "pubmed", {1: [paper("pubmed", "pm", "Silicon device trial")]}
+        ),
+        "semantic_scholar": FakeSource("semantic_scholar", error=timeout),
+    }
+    engine = SearchEngine(
+        LLMConfig.default(),
+        clients=clients,
+        query_planner=QueryPlanner(lambda: TranslationLLM()),
+    )
+
+    response = await engine.search_with_diagnostics("硅光调制器", limit=10)
+
+    assert response.partial is True
+    assert response.query_plan.translation_used is True
+    shared = next(p for p in response.papers if p["doi"] == "10.1000/shared")
+    assert shared["abstract"] == "A richer abstract"
+    assert set(shared["sources"]) == {"openalex", "crossref"}
+    assert {batch.source for batch in response.sources if not batch.ok} == {
+        "semantic_scholar"
+    }

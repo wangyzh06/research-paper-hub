@@ -6,8 +6,7 @@ from engine import (
     get_all_collections, get_collection_detail, create_collection, delete_collection, export_bibtex,
     save_note, get_note, delete_note, get_all_notes,
     create_tag, get_all_tags, delete_tag, add_tag_to_paper, remove_tag_from_paper, get_paper_tags,
-    OpenAlexClient, LLMClient, DeepSeekClient, PDFProcessor, SearchEngine,
-    SEMANTIC_SCHOLAR_API_KEY, DEEPSEEK_API_KEY, LLM_PROVIDERS,
+    OpenAlexClient, LLMClient, PDFProcessor, SearchEngine, LLM_PROVIDERS,
     DEFAULT_LLM_MODEL, DEFAULT_LLM_PROVIDER,
 )
 from app_support import (
@@ -15,6 +14,7 @@ from app_support import (
     build_llm_config,
     consensus_rows,
     format_search_diagnostics,
+    llm_secret_name,
     search_cache_ttl,
 )
 from consensus import ConsensusAnalyzer
@@ -65,8 +65,8 @@ def get_llm_config():
     # Priority: session state > st.secrets > env var
     if not api_key:
         try:
-            secrets_key = f"{provider.upper()}_API_KEY"
-            api_key = st.secrets.get(secrets_key, "")
+            secrets_key = llm_secret_name(provider)
+            api_key = st.secrets.get(secrets_key, "") if secrets_key else ""
         except Exception:
             pass
 
@@ -1301,8 +1301,8 @@ def render_settings():
         # Check if API key is available from secrets
         has_secrets_key = False
         try:
-            secrets_key = f"{selected_provider.upper()}_API_KEY"
-            has_secrets_key = bool(st.secrets.get(secrets_key, ""))
+            secrets_key = llm_secret_name(selected_provider)
+            has_secrets_key = bool(st.secrets.get(secrets_key, "")) if secrets_key else False
         except Exception:
             pass
 
@@ -1327,11 +1327,11 @@ def render_settings():
     2. 添加以下内容：
 
     ```toml
-    DEEPSEEK_API_KEY = "sk-xxx"
+    ZHIPUAI_API_KEY = "xxx"
     OPENAI_API_KEY = "sk-xxx"
     ANTHROPIC_API_KEY = "sk-xxx"
     DASHSCOPE_API_KEY = "sk-xxx"
-    ZHIPUAI_API_KEY = "xxx"
+    DEEPSEEK_API_KEY = "sk-xxx"
     ```
 
     3. 保存后，API Key 将永久生效，无需每次输入。
@@ -1343,9 +1343,10 @@ def render_settings():
     也可以通过 `.env` 文件配置 API Key，优先级：**页面输入 > Streamlit Secrets > 环境变量**
 
     ```env
-    DEEPSEEK_API_KEY=sk-xxx
+    ZHIPUAI_API_KEY=xxx
     OPENAI_API_KEY=sk-xxx
     ANTHROPIC_API_KEY=sk-xxx
+    DEEPSEEK_API_KEY=sk-xxx
     ```
     """)
 

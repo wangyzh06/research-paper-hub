@@ -176,6 +176,7 @@ class ConsensusAnalyzer:
     def __init__(self, llm_factory, max_concurrency: int = 4):
         self.llm_factory = llm_factory
         self.max_concurrency = max(1, max_concurrency)
+        self._stop_reason: str | None = None
 
     @staticmethod
     def _unavailable(paper: dict, reason: str) -> EvidenceItem:
@@ -270,6 +271,8 @@ class ConsensusAnalyzer:
         abstract = paper.get("abstract") or ""
         if not abstract.strip():
             return self._unavailable(paper, "no abstract available")
+        if self._stop_reason:
+            return self._unavailable(paper, self._stop_reason)
 
         schema = (
             "Return one JSON object with keys: eligible (boolean), exclusion_reason, "
@@ -293,6 +296,14 @@ class ConsensusAnalyzer:
             },
         ]
         client = self.llm_factory()
+        if (
+            hasattr(client, "api_key")
+            and not client.api_key
+            and getattr(client, "provider", "") != "ollama"
+        ):
+            self._stop_reason = "missing LLM API key"
+            await self._close_client(client)
+            return self._unavailable(paper, self._stop_reason)
         last_error = "invalid structured response"
         invalid_response = ""
         try:
@@ -312,7 +323,13 @@ class ConsensusAnalyzer:
                     invalid_response = str(raw)
                     return self._parse_evidence(invalid_response, paper)
                 except Exception as error:
-                    last_error = f"evidence extraction failed: {type(error).__name__}"
+                    category = getattr(error, "category", "")
+                    last_error = (
+                        f"evidence extraction failed: {category or type(error).__name__}"
+                    )
+                    if category in {"authentication", "rate_limit", "invalid_configuration"}:
+                        self._stop_reason = last_error
+                        break
             return self._unavailable(paper, last_error)
         finally:
             await self._close_client(client)
@@ -345,10 +362,13 @@ class ConsensusAnalyzer:
 
     async def analyze(self, question: str,
                       papers: Sequence[dict]) -> ConsensusAnalysis:
+        self._stop_reason = None
         semaphore = asyncio.Semaphore(self.max_concurrency)
 
         async def bounded(paper):
             async with semaphore:
+                if self._stop_reason:
+                    return self._unavailable(paper, self._stop_reason)
                 return await self.extract_one(question, paper)
 
         extracted = await asyncio.gather(*(bounded(paper) for paper in papers))
@@ -377,19 +397,20 @@ class ConsensusAnalyzer:
             + json.dumps(evidence_summary, ensure_ascii=False)
         )
         narrative = self._fallback_narrative(score)
-        client = self.llm_factory()
-        try:
-            generated = await client.complete_strict(
-                [
-                    {"role": "system", "content": "Synthesize evidence without changing supplied metrics."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-            )
-            if str(generated).strip():
-                narrative = str(generated).strip()
-        except Exception:
-            pass
-        finally:
-            await self._close_client(client)
+        if not self._stop_reason:
+            client = self.llm_factory()
+            try:
+                generated = await client.complete_strict(
+                    [
+                        {"role": "system", "content": "Synthesize evidence without changing supplied metrics."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                )
+                if str(generated).strip():
+                    narrative = str(generated).strip()
+            except Exception:
+                pass
+            finally:
+                await self._close_client(client)
         return ConsensusAnalysis(evidence, score, narrative)
