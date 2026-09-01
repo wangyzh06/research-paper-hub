@@ -1,9 +1,11 @@
 from app_support import (
     api_key_fingerprint,
     build_llm_config,
+    consensus_rows,
     format_search_diagnostics,
     search_cache_ttl,
 )
+from consensus import ConsensusAnalysis, ConsensusScore, EvidenceItem
 from engine import LLMConfig, QueryPlan, SearchResponse, SourceBatch, SourceError
 
 
@@ -77,3 +79,39 @@ def test_successful_search_uses_normal_cache_ttl():
     response = _response(SourceBatch("openalex", ({"id": "1"},), 1))
 
     assert search_cache_ttl(response) == 300
+
+
+def test_consensus_rows_keep_excluded_and_unavailable_evidence_visible():
+    evidence = EvidenceItem(
+        paper_id="p",
+        title="Paper",
+        eligible=False,
+        exclusion_reason="no direct outcome",
+        study_type="unknown",
+        stance="not_applicable",
+        claim="",
+        excerpt="",
+        quality="unknown",
+        directness=0.0,
+        confidence=0.0,
+        independence_factor=1.0,
+        limitations=("abstract_only",),
+    )
+    score = ConsensusScore.insufficient({"not_applicable": 1})
+
+    rows = consensus_rows(
+        ConsensusAnalysis((evidence,), score, "Insufficient evidence")
+    )
+
+    assert rows == [
+        {
+            "论文": "Paper",
+            "纳入": "否",
+            "立场": "不适用",
+            "研究类型": "unknown",
+            "质量": "unknown",
+            "抽取置信度": 0.0,
+            "核心证据": "no direct outcome",
+            "限制": "abstract_only",
+        }
+    ]

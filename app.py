@@ -13,9 +13,11 @@ from engine import (
 from app_support import (
     api_key_fingerprint,
     build_llm_config,
+    consensus_rows,
     format_search_diagnostics,
     search_cache_ttl,
 )
+from consensus import ConsensusAnalyzer
 
 st.set_page_config(page_title="ResearchPaperHub", page_icon="🎓", layout="wide",
                    initial_sidebar_state="expanded")
@@ -845,159 +847,90 @@ def render_collections():
 # ============================================================
 def render_consensus():
     st.markdown("## 📊 共识分析")
-    st.caption("输入研究主题，分析相关论文的共识程度")
+    st.caption("检索相关研究，逐篇抽取可追溯证据，并计算可审计的共识度")
 
     topic = st.text_area("研究主题或问题", placeholder="例如：Does BERT outperform LSTM in sequence classification tasks?",
                          key="consensus_topic")
 
     if st.button("🔬 开始分析", type="primary", disabled=not topic.strip()):
         topic_text = topic.strip()
-        candidates = []
-        all_rounds = 0
-        max_rounds = 2  # 搜2轮共400篇
-
-        # 先搜完所有轮次，再统一过滤
-        search_tasks = []
+        st.session_state.consensus_analysis = None
+        st.session_state.consensus_papers = []
+        st.session_state.consensus_search_response = None
         with st.spinner("搜索相关论文..."):
-            for rnd in range(max_rounds):
-                engine = SearchEngine()
-                round_results = asyncio.run(engine.search(topic_text, limit=200, source="auto"))
-                if round_results:
-                    candidates.extend(round_results)
-                    all_rounds += 1
-                    st.toast(f"第{rnd+1}轮搜索：{len(round_results)}篇")
+            search_response = _search_with_cache(topic_text, limit=120)
 
-        if not candidates:
-            st.warning("未找到相关论文")
+        diagnostics = format_search_diagnostics(search_response)
+        if diagnostics["all_failed"]:
+            st.error("所有文献源均失败，无法开始共识分析。请检查网络和数据源配置。")
+            return
+        papers = list(search_response.papers[:30])
+        if not papers:
+            st.warning("未找到可分析的相关论文，请尝试更具体或更常用的关键词。")
             return
 
-        # AI 领域过滤：大批次一次过滤（100篇/组，更快）
-        with st.spinner(f"AI 筛选领域相关论文（共{len(candidates)}篇）..."):
-            batch_size = 100
-            relevant_indices = set()
-            for batch_start in range(0, len(candidates), batch_size):
-                batch = candidates[batch_start:batch_start + batch_size]
-                titles_list = "\n".join(
-                    f"[{i}] {p.get('title', '')[:100]}"
-                    for i, p in enumerate(batch)
-                )
-                async def _filter(blist=titles_list):
-                    async with get_llm_client() as c:
-                        prompt = (
-                            f"研究主题：{topic_text}\n\n"
-                            f"从以下论文标题中，找出与上述主题**相关**的论文。只要内容大致相关就保留，"
-                            f"只有明显不相关的研究对象才排除。只返回相关论文的编号，JSON数组如[0,3,5]。\n\n{blist}"
-                        )
-                        result = (await c._complete([
-                            {"role": "system", "content": "只输出JSON数组如[0,3,5]，不要其他内容。"},
-                            {"role": "user", "content": prompt},
-                        ], temperature=0.0)).strip()
-                        import json, re
-                        try:
-                            return set(int(n) for n in re.findall(r'\d+', result))
-                        except Exception:
-                            return set()
-                try:
-                    batch_relevant = asyncio.run(_filter())
-                    relevant_indices.update(batch_relevant)
-                except Exception:
-                    relevant_indices.update(range(len(batch)))
+        with st.spinner(f"GLM 正在逐篇抽取证据（{len(papers)} 篇）..."):
+            analyzer = ConsensusAnalyzer(get_llm_client, max_concurrency=4)
+            analysis = asyncio.run(analyzer.analyze(topic_text, papers))
+        st.session_state.consensus_analysis = analysis
+        st.session_state.consensus_papers = papers
+        st.session_state.consensus_search_response = search_response
+        st.session_state.consensus_question = topic_text
 
-            filtered = [p for i, p in enumerate(candidates) if i in relevant_indices]
-            n_filtered = len(filtered)
-            st.toast(f"AI筛选：{len(candidates)}篇 → {n_filtered}篇相关")
+    analysis = st.session_state.get("consensus_analysis")
+    papers = st.session_state.get("consensus_papers", [])
+    search_response = st.session_state.get("consensus_search_response")
+    if analysis is None:
+        return
 
-        if not filtered:
-            st.warning("未找到领域相关的论文")
-            return
+    if search_response is not None:
+        diagnostics = format_search_diagnostics(search_response)
+        if diagnostics["failed_sources"]:
+            failed = "、".join(diagnostics["failed_sources"])
+            st.warning(f"部分文献源失败：{failed}。共识结果仅基于成功返回的来源。")
 
-        candidates = filtered
+    st.warning(
+        "本分析只使用题名和摘要，不能确认摘要未报告的样本量、效应量、P 值、"
+        "置信区间或完整偏倚风险；结果不能替代系统综述或 Meta 分析。"
+    )
+    score = analysis.score
+    direction_labels = {
+        "support": "支持",
+        "oppose": "反对",
+        "mixed": "分歧",
+        "insufficient_evidence": "证据不足",
+    }
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("置信度校正共识分", "证据不足" if score.score is None else f"{score.score}/100")
+    c2.metric("主要方向", direction_labels.get(score.direction, score.direction))
+    c3.metric("方向一致率", f"{score.directional_agreement:.1%}")
+    c4.metric("证据确定性", f"{score.evidence_certainty:.1%}")
+    st.caption(
+        f"有效独立研究数：{score.effective_independent_studies:.2f} · "
+        f"加权支持：{score.weighted_support:.3f} · "
+        f"加权反对：{score.weighted_oppose:.3f} · "
+        f"加权混合：{score.weighted_mixed:.3f}"
+    )
 
-        # TF-IDF 语义排序 + 取前30篇
-        with st.spinner("计算语义相关性..."):
-            texts = [topic_text] + [f"{p.get('title', '')} {(p.get('abstract') or '')[:500]}" for p in candidates]
-            try:
-                from sklearn.feature_extraction.text import TfidfVectorizer
-                from sklearn.metrics.pairwise import cosine_similarity
-                vectorizer = TfidfVectorizer(max_features=2000, stop_words="english")
-                tfidf = vectorizer.fit_transform(texts)
-                sims = cosine_similarity(tfidf[0:1], tfidf[1:])[0]
-            except ImportError:
-                t_terms = set(topic_text.lower().split())
-                sims = [
-                    sum(1 for term in t_terms if term in f"{p.get('title','')} {(p.get('abstract') or '')}".lower())
-                    / max(1, len(t_terms))
-                    for p in candidates
-                ]
-            for i, p in enumerate(candidates):
-                p["_sim"] = float(sims[i]) if i < len(sims) else 0
-            candidates.sort(key=lambda p: p.get("_sim", 0), reverse=True)
+    st.markdown("### 逐篇证据审计表")
+    st.dataframe(consensus_rows(analysis), use_container_width=True, hide_index=True)
+    st.markdown("### 证据综合")
+    st.markdown(analysis.narrative)
 
-        papers = candidates[:30]
-        st.info(f"共搜索 {all_rounds} 轮，从 {len(candidates)} 篇相关论文中选取了 {len(papers)} 篇")
-
-        with st.spinner("AI 共识分析中..."):
-            paper_list = "\n".join(f"[{i+1}] {p.get('title','')} ({p.get('year','')})" for i, p in enumerate(papers))
-            paper_texts = "\n\n".join(f"[{i+1}] {p.get('title','')}\n{(p.get('abstract') or '')[:800]}" for i, p in enumerate(papers))
-            async def _analyze():
-                async with get_llm_client() as c:
-                    prompt = (
-                        f"你是一个学术研究分析专家。请对以下 {len(papers)} 篇关于「{topic_text}」的论文进行深度共识分析。\n\n"
-                        "请按以下格式输出完整报告：\n\n"
-                        "## 1. 共识度评分\n"
-                        "给出0-100的共识度评分，说明评分依据。\n\n"
-                        "## 2. 研究方法分布\n"
-                        "统计这组论文采用的研究方法（实验/理论/模拟/综述等），评估整体证据质量（高/中/低）。\n\n"
-                        "## 3. 主要一致观点\n"
-                        "列出3-5个学术界一致认同的发现，每点标注支持论文编号。\n\n"
-                        "## 4. 主要争议与分歧\n"
-                        "列出存在分歧的观点，说明各方立场及论文编号，分析分歧原因（方法差异/数据差异/理论框架差异）。\n\n"
-                        "## 5. 研究空白\n"
-                        "基于现有论文，识别2-3个尚未充分研究的问题或方向。\n\n"
-                        "## 6. 方法论评估\n"
-                        "对比各论文的研究方法优劣，指出可能的方法学局限（样本量、实验设计、统计方法等）。\n\n"
-                        "## 7. 统计证据强度\n"
-                        "评估关键结论的统计证据强度（效应量、显著性、可重复性），标注需要更多验证的结论。\n\n"
-                        "## 8. 论文立场标注\n"
-                        "按以下格式标注每篇论文在核心议题上的立场：\n"
-                        "[1] 论文标题 — ✅支持/❌反对/➖中立 — 关键论据\n"
-                        "[2] ...\n\n"
-                        f"论文列表：\n{paper_list}\n\n"
-                        f"论文详情：\n{paper_texts}"
-                    )
-                    return await c._complete([
-                        {"role": "system", "content": "你是专业的学术共识分析专家。请生成详细、有深度的分析报告，每项声明都必须引用论文编号。"},
-                        {"role": "user", "content": prompt},
-                    ])
-            analysis = asyncio.run(_analyze())
-
-        # Extract score (take the LAST number on the consensus line, not the section number)
-        import re
-        score = 50
-        for line in analysis.split("\n"):
-            if "共识度评分" in line or ("共识度" in line and re.search(r'\d+', line)):
-                nums = re.findall(r'\d+', line)
-                if nums:
-                    score = min(100, max(0, int(nums[-1])))  # LAST number, not first
-                    break
-
-        st.markdown("---")
-        c1, c2 = st.columns([1, 3])
-        with c1:
-            st.markdown(f'<div class="stat-card"><div class="stat-value">{score}%</div><div class="stat-label">共识度</div></div>',
-                        unsafe_allow_html=True)
-        with c2:
-            st.markdown(analysis)
-
-        st.divider()
-        st.markdown(f"### 相关论文 ({len(papers)} 篇)")
-        for i, p in enumerate(papers[:30]):
-            with st.expander(f"[{i+1}] {p.get('title', '无标题')}"):
-                st.caption((p.get("abstract") or "")[:500])
-                meta = []
-                if p.get("year"): meta.append(f"📅 {p['year']}")
-                if p.get("citation_count"): meta.append(f"📊 引用 {p['citation_count']}")
-                if meta: st.caption(" · ".join(meta))
+    st.divider()
+    st.markdown(f"### 纳入检索结果 ({len(papers)} 篇)")
+    for i, paper in enumerate(papers):
+        with st.expander(f"[{i+1}] {paper.get('title', '无标题')}"):
+            st.caption((paper.get("abstract") or "无摘要")[:800])
+            meta = []
+            if paper.get("year"):
+                meta.append(f"📅 {paper['year']}")
+            if paper.get("citation_count"):
+                meta.append(f"📊 引用 {paper['citation_count']}")
+            if paper.get("sources"):
+                meta.append("来源 " + ", ".join(paper["sources"]))
+            if meta:
+                st.caption(" · ".join(meta))
 
 
 # ============================================================

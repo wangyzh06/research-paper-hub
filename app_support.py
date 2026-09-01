@@ -11,6 +11,7 @@ from engine import (
     LLM_PROVIDERS,
     SearchResponse,
 )
+from consensus import ConsensusAnalysis
 
 
 def api_key_fingerprint(api_key: str) -> str:
@@ -64,3 +65,27 @@ def search_cache_ttl(response: SearchResponse) -> int:
     if response.partial:
         return 30 if any(error.retryable for error in errors) else 60
     return 300
+
+
+def consensus_rows(analysis: ConsensusAnalysis) -> list[dict]:
+    """Return all evidence, including exclusions, in a stable UI table shape."""
+    stance_labels = {
+        "support": "支持",
+        "oppose": "反对",
+        "mixed": "混合",
+        "uncertain": "不确定",
+        "not_applicable": "不适用",
+    }
+    return [
+        {
+            "论文": item.title,
+            "纳入": "是" if item.eligible else "否",
+            "立场": stance_labels.get(item.stance, "不确定"),
+            "研究类型": item.study_type,
+            "质量": item.quality,
+            "抽取置信度": item.confidence,
+            "核心证据": item.claim if item.eligible else item.exclusion_reason,
+            "限制": "、".join(item.limitations),
+        }
+        for item in analysis.evidence
+    ]
