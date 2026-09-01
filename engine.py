@@ -1429,7 +1429,9 @@ class SearchEngine:
     def __init__(self, llm_config: LLMConfig | None = None,
                  clients: dict[str, object] | None = None, query_planner=None):
         self.llm_config = llm_config or LLMConfig.default()
-        clients = clients or {}
+        self._clients_injected = clients is not None
+        clients = dict(clients or {})
+        self.clients = clients
         self._oa = None  # OpenAlex
         self._arx = None # arXiv
         self._ss = None  # Semantic Scholar
@@ -1450,11 +1452,24 @@ class SearchEngine:
         )
 
     async def _ensure_clients(self):
-        if self._oa is None: self._oa = OpenAlexClient()
-        if self._arx is None: self._arx = ArxivClient()
-        if self._ss is None: self._ss = SemanticScholarClient()
-        if self._cr is None: self._cr = CrossrefClient()
-        if self._pm is None: self._pm = PubMedClient()
+        if not self._clients_injected:
+            if self._oa is None: self._oa = OpenAlexClient()
+            if self._arx is None: self._arx = ArxivClient()
+            if self._ss is None and SEMANTIC_SCHOLAR_API_KEY:
+                self._ss = SemanticScholarClient()
+            if self._cr is None: self._cr = CrossrefClient()
+            if self._pm is None: self._pm = PubMedClient()
+        self.clients = {
+            name: client
+            for name, client in {
+                "openalex": self._oa,
+                "arxiv": self._arx,
+                "semantic_scholar": self._ss,
+                "crossref": self._cr,
+                "pubmed": self._pm,
+            }.items()
+            if client is not None
+        }
 
     async def _translate_to_english(self, chinese_query: str) -> str:
         try:
@@ -1472,77 +1487,210 @@ class SearchEngine:
 
     async def search(self, query: str, limit: int = 20, source: str = "auto",
                      sort: str = "relevance") -> list[dict]:
-        if not query.strip():
-            return []
+        response = await self.search_with_diagnostics(query, limit, source, sort)
+        return list(response.papers)
+
+    async def search_with_diagnostics(self, query: str, limit: int = 20,
+                                      source: str = "auto",
+                                      sort: str = "relevance") -> SearchResponse:
+        plan = await self.query_planner.build(query)
+        if not plan.original or limit <= 0:
+            return SearchResponse((), plan, ())
+
         await self._ensure_clients()
-        effective_query = query.strip()  # save original for relevance scoring
+        selected_clients = self.clients
+        if source != "auto":
+            selected_clients = {
+                source: self.clients[source]
+            } if source in self.clients else {}
 
-        # 中文查询 → 翻译成英文
-        if _contains_chinese(query):
-            effective_query = await self._translate_to_english(query)
-            if not effective_query or effective_query == query:
-                effective_query = query
-        else:
-            effective_query = query
-
-        # 查询扩展：生成 3-5 个同义搜索词
-        expanded = await self._expand_query(effective_query)
-        expanded = [effective_query] + [t for t in expanded if t.lower() != effective_query.lower()]
-        expanded = expanded[:5]  # 最多 5 个搜索词
-
-        if source == "arxiv":
-            arx_total = []
-            for eq in expanded[:3]:
-                r = await self._arx.search(eq, max_results=limit // len(expanded[:3]) + 10)
-                arx_total.extend(r.get("results", []))
-            results = self._deduplicate(arx_total, limit)
-            return self._sort_results(query, results, sort)
-
-        if source == "openalex":
-            raw = await self._search_oa_expanded(expanded, limit)
-            results = self._deduplicate(raw, limit)
-            return self._sort_results(query, results, sort)
-
-        # "auto" / default: 四源并行检索
-        # OpenAlex + arXiv + Crossref (+ Semantic Scholar if key available)
-        oa_raw = await self._search_oa_expanded(expanded, limit * 3)
-        arx_raw, cr_raw, ss_raw = [], [], []
+        per_query_limit = max(10, min(100, limit))
         tasks = []
-        for eq in expanded[:2]:
-            tasks.append(self._arx.search(eq, max_results=40))
-            tasks.append(self._cr.search(eq, limit=40))
-        if SEMANTIC_SCHOLAR_API_KEY:
-            for eq in expanded[:2]:
-                tasks.append(self._ss.search(eq, limit=40))
+        task_meta = []
+        for source_name, client in selected_clients.items():
+            for variant_index, variant in enumerate(plan.variants):
+                task_meta.append((source_name, variant_index, variant))
+                tasks.append(
+                    self._fetch_source_query(
+                        source_name, client, variant, per_query_limit, limit
+                    )
+                )
 
-        gathered = await _asyncio.gather(*tasks, return_exceptions=True)
-        idx = 0
-        for _ in expanded[:2]:
-            r = gathered[idx]; idx += 1
-            if isinstance(r, dict): arx_raw.extend(r.get("results", []))
-            r = gathered[idx]; idx += 1
-            if isinstance(r, dict): cr_raw.extend(r.get("results", []))
-        if SEMANTIC_SCHOLAR_API_KEY:
-            for _ in expanded[:2]:
-                r = gathered[idx]; idx += 1
-                if isinstance(r, list): ss_raw.extend(r)
+        occurrences = []
+        source_calls: dict[str, list[SourceBatch]] = {
+            name: [] for name in selected_clients
+        }
+        try:
+            gathered = await _asyncio.gather(*tasks, return_exceptions=True)
+            for meta, result in zip(task_meta, gathered):
+                source_name, variant_index, _variant = meta
+                if isinstance(result, Exception):
+                    result = SourceBatch(source_name, (), 0, _source_error(result))
+                source_calls[source_name].append(result)
+                if result.ok:
+                    for rank, paper in enumerate(result.papers, start=1):
+                        occurrences.append((source_name, variant_index, rank, paper))
+        finally:
+            await self._close_clients(selected_clients.values())
 
-        # Tag sources
-        for p in cr_raw: p["source"] = "crossref"
-        for p in arx_raw: p["source"] = "arxiv"
-        for p in ss_raw:
-            p = {"id": p.get("paperId", ""), "source": "semantic_scholar",
-                 "title": p.get("title", ""), "abstract": p.get("abstract", ""),
-                 "year": p.get("year"), "citation_count": p.get("citationCount", 0),
-                 "venue": (p.get("journal") or {}).get("name", ""),
-                 "authors": [{"name": a.get("name", "")} for a in p.get("authors", [])],
-                 "url": p.get("url", ""), "doi": "", "_source": "ss"}
-
-        # DOI 去重 + 合并
-        merged = self._doi_deduplicate(
-            oa_raw + arx_raw + cr_raw + ss_raw, limit * 3
+        source_batches = tuple(
+            self._combine_source_batches(name, source_calls[name])
+            for name in selected_clients
         )
-        return self._sort_results(query, merged[:limit], sort)
+        merged = self._merge_and_rank(plan, occurrences, sort)
+        selected = self._select_diverse(merged, source_batches, limit)
+        return SearchResponse(tuple(selected), plan, source_batches)
+
+    async def _fetch_source_query(self, source_name: str, client, query: str,
+                                  request_limit: int, result_limit: int) -> SourceBatch:
+        first = await client.search(query, limit=request_limit, page=1, offset=0)
+        if not isinstance(first, SourceBatch) or not first.ok:
+            return first
+        papers = list(first.papers)
+        error = None
+        if first.total > len(papers) and len(papers) < result_limit:
+            second_offset = len(papers) if source_name == "semantic_scholar" else 0
+            second = await client.search(
+                query,
+                limit=request_limit,
+                page=2,
+                offset=second_offset,
+            )
+            if isinstance(second, SourceBatch):
+                if second.ok:
+                    papers.extend(second.papers)
+                else:
+                    error = second.error
+        return SourceBatch(source_name, tuple(papers), first.total, error)
+
+    async def _close_clients(self, clients) -> None:
+        seen = set()
+        for client in clients:
+            if id(client) in seen:
+                continue
+            seen.add(id(client))
+            close = getattr(client, "aclose", None)
+            if close:
+                try:
+                    await close()
+                except Exception:
+                    logger.warning("literature source close failed: %s", type(client).__name__)
+
+    @staticmethod
+    def _combine_source_batches(source_name: str,
+                                batches: list[SourceBatch]) -> SourceBatch:
+        papers = []
+        total = 0
+        error = None
+        for batch in batches:
+            papers.extend(batch.papers)
+            total = max(total, batch.total)
+            if batch.error and error is None:
+                error = batch.error
+        return SourceBatch(source_name, tuple(papers), total, error)
+
+    @staticmethod
+    def _normalized_title(value: str) -> str:
+        return " ".join(re.findall(r"[\w\u4e00-\u9fff]+", (value or "").casefold()))
+
+    def _paper_identity(self, paper: dict) -> str:
+        doi = normalize_doi(paper.get("doi"))
+        if doi:
+            return f"doi:{doi}"
+        title = self._normalized_title(paper.get("title", ""))
+        if title:
+            return f"title:{title}:{paper.get('year') or ''}"
+        return f"{paper.get('source', 'unknown')}:{paper.get('id', '')}"
+
+    @staticmethod
+    def _merge_paper(existing: dict, incoming: dict) -> None:
+        source = incoming.get("source", "")
+        if source and source not in existing["sources"]:
+            existing["sources"].append(source)
+        for field in ("abstract", "title"):
+            if len(incoming.get(field, "") or "") > len(existing.get(field, "") or ""):
+                existing[field] = incoming[field]
+        for field in ("authors",):
+            if len(incoming.get(field) or []) > len(existing.get(field) or []):
+                existing[field] = incoming[field]
+        for field in ("venue", "url", "doi", "year"):
+            if not existing.get(field) and incoming.get(field):
+                existing[field] = incoming[field]
+        existing["citation_count"] = max(
+            existing.get("citation_count", 0) or 0,
+            incoming.get("citation_count", 0) or 0,
+        )
+
+    def _merge_and_rank(self, plan: QueryPlan, occurrences, sort: str) -> list[dict]:
+        by_identity = {}
+        for source_name, variant_index, rank, raw in occurrences:
+            paper = dict(raw)
+            paper["doi"] = normalize_doi(paper.get("doi"))
+            paper.setdefault("source", source_name)
+            identity = self._paper_identity(paper)
+            if identity not in by_identity:
+                paper["sources"] = [paper["source"]]
+                paper["_fusion_score"] = 0.0
+                by_identity[identity] = paper
+            else:
+                self._merge_paper(by_identity[identity], paper)
+            query_weight = 1.25 if variant_index == 0 else 1.0
+            by_identity[identity]["_fusion_score"] += query_weight / (60 + rank)
+
+        variants = [self._normalized_title(value) for value in plan.variants]
+        query_terms = {
+            token
+            for variant in variants
+            for token in variant.split()
+            if len(token) > 1
+        }
+        original_title = self._normalized_title(plan.original)
+        for paper in by_identity.values():
+            text = self._normalized_title(
+                f"{paper.get('title', '')} {paper.get('abstract', '')}"
+            )
+            overlap = sum(1 for term in query_terms if term in text)
+            paper["_lexical_score"] = overlap / max(1, len(query_terms))
+            if self._normalized_title(paper.get("title", "")) == original_title:
+                paper["_fusion_score"] += 2.0
+            paper["_score"] = paper["_fusion_score"] + 0.25 * paper["_lexical_score"]
+
+        papers = list(by_identity.values())
+        if sort == "year":
+            papers.sort(key=lambda p: (p.get("year") or 0, p["_score"]), reverse=True)
+        elif sort == "citations":
+            papers.sort(key=lambda p: (p.get("citation_count") or 0, p["_score"]), reverse=True)
+        else:
+            papers.sort(key=lambda p: (p["_score"], p.get("citation_count") or 0), reverse=True)
+        return papers
+
+    @staticmethod
+    def _select_diverse(papers: list[dict], source_batches: tuple[SourceBatch, ...],
+                        limit: int) -> list[dict]:
+        successful_sources = [batch.source for batch in source_batches if batch.ok and batch.papers]
+        if limit < len(successful_sources):
+            return papers[:limit]
+        selected = []
+        selected_ids = set()
+        for source_name in successful_sources:
+            candidate = next(
+                (
+                    paper for paper in papers
+                    if source_name in paper.get("sources", [])
+                    and id(paper) not in selected_ids
+                ),
+                None,
+            )
+            if candidate is not None:
+                selected.append(candidate)
+                selected_ids.add(id(candidate))
+        for paper in papers:
+            if len(selected) >= limit:
+                break
+            if id(paper) not in selected_ids:
+                selected.append(paper)
+                selected_ids.add(id(paper))
+        return selected[:limit]
 
     async def _search_oa_expanded(self, queries: list[str], limit: int) -> list[dict]:
         per_q = max(30, limit // max(1, len(queries)) + 5)
