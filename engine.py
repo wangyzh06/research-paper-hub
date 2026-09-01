@@ -1,6 +1,7 @@
 import os
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,27 @@ def _httpx_timeout_types() -> tuple[type[BaseException], ...]:
         if isinstance((error_type := getattr(httpx, name, None)), type)
         and issubclass(error_type, BaseException)
     )
+
+
+def _httpx_network_types() -> tuple[type[BaseException], ...]:
+    names = (
+        "NetworkError", "ProtocolError", "ConnectError", "ReadError",
+        "WriteError", "CloseError", "ProxyError", "StreamError",
+    )
+    modules = (httpx, getattr(httpx, "_exceptions", None))
+    error_types = []
+    for module in modules:
+        if module is None:
+            continue
+        for name in names:
+            error_type = getattr(module, name, None)
+            if (
+                isinstance(error_type, type)
+                and issubclass(error_type, BaseException)
+                and error_type not in error_types
+            ):
+                error_types.append(error_type)
+    return tuple(error_types)
 
 # ============================================================
 # Config
@@ -591,6 +613,7 @@ def _source_error(error: Exception) -> SourceError:
     status_code = getattr(response, "status_code", None)
     http_status_error = getattr(httpx, "HTTPStatusError", ())
     timeout_errors = _httpx_timeout_types()
+    network_errors = _httpx_network_types()
     if status_code is not None or (http_status_error and isinstance(error, http_status_error)):
         if status_code in {401, 403}:
             category = "authentication"
@@ -600,11 +623,15 @@ def _source_error(error: Exception) -> SourceError:
             category = "http"
     elif timeout_errors and isinstance(error, timeout_errors):
         category = "timeout"
+    elif (network_errors and isinstance(error, network_errors)) or isinstance(
+        error, (ConnectionError, OSError)
+    ):
+        category = "network"
     elif isinstance(error, (ValueError, KeyError, TypeError, ET.ParseError)):
         category = "response_parsing"
     else:
         category = "request"
-    retryable = category in {"timeout", "rate_limit"} or bool(
+    retryable = category in {"timeout", "rate_limit", "network"} or bool(
         status_code and status_code >= 500
     )
     return SourceError(category, status_code, retryable, str(error)[:240])
@@ -894,9 +921,14 @@ class LLMRequestError(RuntimeError):
 
 def _llm_error_category(error: Exception) -> str:
     timeout_errors = _httpx_timeout_types()
+    network_errors = _httpx_network_types()
     http_status_error = getattr(httpx, "HTTPStatusError", ())
     if timeout_errors and isinstance(error, timeout_errors):
         return "timeout"
+    if (network_errors and isinstance(error, network_errors)) or isinstance(
+        error, (ConnectionError, OSError)
+    ):
+        return "network"
     response = getattr(error, "response", None)
     status = getattr(response, "status_code", None)
     if status is not None or (http_status_error and isinstance(error, http_status_error)):
@@ -1485,8 +1517,24 @@ class QueryPlanner:
 
 class SearchEngine:
     def __init__(self, llm_config: LLMConfig | None = None,
-                 clients: dict[str, object] | None = None, query_planner=None):
+                 clients: dict[str, object] | None = None, query_planner=None,
+                 retry_delays: tuple[float, ...] = (1.0,),
+                 source_intervals: dict[str, float] | None = None,
+                 source_request_caps: dict[str, int] | None = None):
         self.llm_config = llm_config or LLMConfig.default()
+        self.retry_delays = retry_delays
+        self.source_intervals = dict(source_intervals) if source_intervals is not None else {
+            "arxiv": 1.0,
+            "semantic_scholar": 1.05,
+            "crossref": 0.25,
+            "pubmed": 1.05,
+        }
+        self.source_request_caps = (
+            dict(source_request_caps)
+            if source_request_caps is not None
+            else {"crossref": 20}
+        )
+        self._source_last_request: dict[str, float] = {}
         self._clients_injected = clients is not None
         clients = dict(clients or {})
         self.clients = clients
@@ -1562,17 +1610,25 @@ class SearchEngine:
                 source: self.clients[source]
             } if source in self.clients else {}
 
-        per_query_limit = max(10, min(100, limit))
+        variant_count = max(1, len(plan.variants))
+        source_budget = max(20, min(200, limit * 2))
+        per_variant_budget = max(
+            10, (source_budget + variant_count - 1) // variant_count
+        )
+        request_limit = min(100, per_variant_budget)
+        source_items = list(selected_clients.items())
         tasks = []
-        task_meta = []
-        for source_name, client in selected_clients.items():
-            for variant_index, variant in enumerate(plan.variants):
-                task_meta.append((source_name, variant_index, variant))
-                tasks.append(
-                    self._fetch_source_query(
-                        source_name, client, variant, per_query_limit, limit
-                    )
-                )
+        for source_name, client in source_items:
+            source_cap = self.source_request_caps.get(source_name, 100)
+            source_request_limit = min(request_limit, source_cap)
+            source_variant_budget = min(per_variant_budget, source_cap)
+            tasks.append(self._fetch_source_variants(
+                source_name,
+                client,
+                plan.variants,
+                source_request_limit,
+                source_variant_budget,
+            ))
 
         occurrences = []
         source_calls: dict[str, list[SourceBatch]] = {
@@ -1580,13 +1636,15 @@ class SearchEngine:
         }
         try:
             gathered = await _asyncio.gather(*tasks, return_exceptions=True)
-            for meta, result in zip(task_meta, gathered):
-                source_name, variant_index, _variant = meta
-                if isinstance(result, Exception):
-                    result = SourceBatch(source_name, (), 0, _source_error(result))
-                source_calls[source_name].append(result)
-                for rank, paper in enumerate(result.papers, start=1):
-                    occurrences.append((source_name, variant_index, rank, paper))
+            for (source_name, _client), source_result in zip(source_items, gathered):
+                if isinstance(source_result, Exception):
+                    source_result = (
+                        (0, SourceBatch(source_name, (), 0, _source_error(source_result))),
+                    )
+                for variant_index, result in source_result:
+                    source_calls[source_name].append(result)
+                    for rank, paper in enumerate(result.papers, start=1):
+                        occurrences.append((source_name, variant_index, rank, paper))
         finally:
             await self._close_clients(selected_clients.values())
 
@@ -1598,18 +1656,78 @@ class SearchEngine:
         selected = self._select_diverse(merged, source_batches, limit)
         return SearchResponse(tuple(selected), plan, source_batches)
 
+    async def _fetch_source_variants(self, source_name: str, client,
+                                     variants: tuple[str, ...], request_limit: int,
+                                     per_variant_budget: int):
+        """Run sources in parallel while keeping each provider's calls serial."""
+        results = []
+        for variant_index, variant in enumerate(variants):
+            try:
+                batch = await self._fetch_source_query(
+                    source_name,
+                    client,
+                    variant,
+                    request_limit,
+                    per_variant_budget,
+                )
+            except Exception as error:
+                batch = SourceBatch(source_name, (), 0, _source_error(error))
+            results.append((variant_index, batch))
+            if batch.error and batch.error.category in {
+                "authentication", "rate_limit", "network", "timeout"
+            }:
+                break
+        return tuple(results)
+
+    async def _request_source_batch(self, source_name: str, client, query: str,
+                                    limit: int, page: int, offset: int) -> SourceBatch:
+        async def request_once() -> SourceBatch:
+            try:
+                interval = self.source_intervals.get(source_name, 0.0)
+                last_request = self._source_last_request.get(source_name)
+                if interval > 0 and last_request is not None:
+                    remaining = interval - (time.monotonic() - last_request)
+                    if remaining > 0:
+                        await _asyncio.sleep(remaining)
+                self._source_last_request[source_name] = time.monotonic()
+                result = await client.search(
+                    query, limit=limit, page=page, offset=offset
+                )
+                if isinstance(result, SourceBatch):
+                    return result
+                return SourceBatch(
+                    source_name,
+                    (),
+                    0,
+                    SourceError("response_parsing", None, False, "invalid source response"),
+                )
+            except Exception as error:
+                return SourceBatch(source_name, (), 0, _source_error(error))
+
+        batch = await request_once()
+        for delay in self.retry_delays:
+            if batch.error is None or not batch.error.retryable:
+                break
+            await _asyncio.sleep(max(0.0, delay))
+            batch = await request_once()
+        return batch
+
     async def _fetch_source_query(self, source_name: str, client, query: str,
                                   request_limit: int, result_limit: int) -> SourceBatch:
-        first = await client.search(query, limit=request_limit, page=1, offset=0)
+        first = await self._request_source_batch(
+            source_name, client, query, request_limit, page=1, offset=0
+        )
         if not isinstance(first, SourceBatch) or not first.ok:
             return first
         papers = list(first.papers)
         error = None
         if first.total > len(papers) and len(papers) < result_limit:
             second_offset = len(papers) if source_name == "semantic_scholar" else 0
-            second = await client.search(
+            second = await self._request_source_batch(
+                source_name,
+                client,
                 query,
-                limit=request_limit,
+                request_limit,
                 page=2,
                 offset=second_offset,
             )

@@ -153,6 +153,17 @@ async def test_source_timeout_is_reported_as_retryable_error():
 
 
 @pytest.mark.asyncio
+async def test_transient_network_reset_is_reported_as_retryable_error():
+    client = OpenAlexClient.__new__(OpenAlexClient)
+    client.client = SequenceHttpClient([httpx.NetworkError("connection reset")])
+
+    batch = await client.search("paper")
+
+    assert batch.error.category == "network"
+    assert batch.error.retryable is True
+
+
+@pytest.mark.asyncio
 async def test_semantic_scholar_search_normalizes_papers_in_batch():
     client = SemanticScholarClient.__new__(SemanticScholarClient)
     client.client = SequenceHttpClient(
