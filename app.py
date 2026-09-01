@@ -1,4 +1,5 @@
 import asyncio
+import time
 import streamlit as st
 from engine import (
     init_db, save_paper_to_db, add_to_collection, remove_from_collection,
@@ -8,6 +9,12 @@ from engine import (
     OpenAlexClient, LLMClient, DeepSeekClient, PDFProcessor, SearchEngine,
     SEMANTIC_SCHOLAR_API_KEY, DEEPSEEK_API_KEY, LLM_PROVIDERS,
     DEFAULT_LLM_MODEL, DEFAULT_LLM_PROVIDER,
+)
+from app_support import (
+    api_key_fingerprint,
+    build_llm_config,
+    format_search_diagnostics,
+    search_cache_ttl,
 )
 
 st.set_page_config(page_title="ResearchPaperHub", page_icon="🎓", layout="wide",
@@ -33,6 +40,7 @@ st.markdown("""
 # ============================================================
 defaults = {
     "page": "home", "search_query": "", "search_results": [],
+    "search_cache": {}, "search_response": None,
     "show_summary": "", "show_chat": "", "show_graph": "", "show_similar": "", "show_note": "",
     "compare_selected": [],
 }
@@ -46,8 +54,8 @@ def navigate(page: str):
     st.rerun()
 
 
-def get_llm_client():
-    """Create LLMClient with current session settings (secrets > session state > env)."""
+def get_llm_config():
+    """Resolve the active provider without exposing its API key to cache entries."""
     provider = st.session_state.get("llm_provider", DEFAULT_LLM_PROVIDER)
     model = st.session_state.get("llm_model", "")
     api_key = st.session_state.get("llm_api_key", "")
@@ -60,7 +68,17 @@ def get_llm_client():
         except Exception:
             pass
 
-    return LLMClient(provider=provider, api_key=api_key, model=model)
+    return build_llm_config(provider, model, api_key)
+
+
+def get_llm_client():
+    """Create an LLM client using the current page configuration."""
+    config = get_llm_config()
+    return LLMClient(
+        provider=config.provider,
+        api_key=config.api_key,
+        model=config.model,
+    )
 
 
 # ============================================================
@@ -127,12 +145,49 @@ def render_home():
 # ============================================================
 # Search Page
 # ============================================================
-@st.cache_data(ttl=300, show_spinner=False)
-def _cached_search(query: str, limit: int = 100, sort: str = "relevance") -> list[dict]:
+def _search_cache_key(query: str, limit: int, sort: str, config) -> tuple:
+    return (
+        " ".join(query.split()).casefold(),
+        limit,
+        sort,
+        config.provider,
+        config.model,
+        api_key_fingerprint(config.api_key),
+    )
+
+
+def _search_with_cache(query: str, limit: int = 100, sort: str = "relevance",
+                       force_refresh: bool = False):
+    config = get_llm_config()
+    key = _search_cache_key(query, limit, sort, config)
+    cache = st.session_state.search_cache
+    now = time.monotonic()
+    if force_refresh:
+        cache.pop(key, None)
+    cached = cache.get(key)
+    if cached and cached["expires_at"] > now:
+        return cached["response"]
+
     async def _s():
-        engine = SearchEngine()
-        return await engine.search(query, limit, source="auto", sort=sort)
-    return asyncio.run(_s())
+        engine = SearchEngine(llm_config=config)
+        return await engine.search_with_diagnostics(
+            query, limit, source="auto", sort=sort
+        )
+
+    response = asyncio.run(_s())
+    ttl = search_cache_ttl(response)
+    if ttl:
+        cache[key] = {"response": response, "expires_at": now + ttl}
+        if len(cache) > 32:
+            oldest_key = min(cache, key=lambda item: cache[item]["expires_at"])
+            cache.pop(oldest_key, None)
+    return response
+
+
+def _cached_search(query: str, limit: int = 100,
+                   sort: str = "relevance") -> list[dict]:
+    """Compatibility wrapper used by the comparison page."""
+    return list(_search_with_cache(query, limit, sort).papers)
 
 
 def render_search():
@@ -142,6 +197,9 @@ def render_search():
     with c1:
         q = st.text_input("搜索关键词", value=st.session_state.get("search_query", ""),
                           key="search_input", placeholder="输入关键词搜索论文...")
+    with c2:
+        st.write("")
+        retry_requested = st.button("🔄 重试", use_container_width=True)
     if (q or "").strip():
         st.session_state.search_query = (q or "").strip()
 
@@ -158,14 +216,45 @@ def render_search():
             horizontal=True, key="sort_radio",
             index=list(sort_options.keys()).index(st.session_state.search_sort))
 
+        search_context = (
+            st.session_state.search_query.casefold(),
+            st.session_state.search_sort,
+        )
+        if st.session_state.get("last_search_context") != search_context:
+            st.session_state.search_page = 0
+            st.session_state.last_search_context = search_context
+
         with st.spinner("搜索中..."):
-            results = _cached_search(st.session_state.search_query, limit=200,
-                                     sort=st.session_state.search_sort)
-            # 缓存可能返回空（旧的失败结果），直接搜索一次作为兜底
-            if not results:
-                engine = SearchEngine()
-                results = asyncio.run(engine.search(st.session_state.search_query, limit=200, source="auto", sort=st.session_state.search_sort))
+            response = _search_with_cache(
+                st.session_state.search_query,
+                limit=200,
+                sort=st.session_state.search_sort,
+                force_refresh=retry_requested,
+            )
+            results = list(response.papers)
             st.session_state.search_results = results
+            st.session_state.search_response = response
+
+        diagnostics = format_search_diagnostics(response)
+        if diagnostics["all_failed"]:
+            failed = "、".join(diagnostics["failed_sources"])
+            st.error(f"所有文献源均检索失败（{failed}）。请检查网络或认证配置后重试。")
+        elif diagnostics["failed_sources"]:
+            failed = "、".join(
+                f"{name}（{diagnostics['errors'][name]['category']}）"
+                for name in diagnostics["failed_sources"]
+            )
+            st.warning(f"部分文献源暂时失败：{failed}。当前结果来自其余可用来源。")
+
+        source_counts = " · ".join(
+            f"{name}: {count}" for name, count in diagnostics["source_counts"].items()
+        )
+        if source_counts:
+            st.caption(f"来源返回量：{source_counts}")
+        if diagnostics["translation_used"]:
+            st.caption("已使用 GLM 生成英文检索变体，以提高中文主题的召回率。")
+        elif diagnostics["ai_error"]:
+            st.caption("GLM 查询扩展不可用，本次已自动回退为原始关键词检索。")
 
         results = st.session_state.search_results
         total = len(results)
@@ -249,7 +338,7 @@ def render_search():
                             st.markdown(f"**{t['year']}**: {t['count']} 篇, 总引用 {t['total_citations']}, 平均引用 {t['avg_citations']}")
                 else:
                     st.info("无时间线数据")
-        else:
+        elif not diagnostics["all_failed"]:
             st.warning("未找到相关论文，请尝试其他关键词")
 
 
