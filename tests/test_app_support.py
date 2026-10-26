@@ -24,9 +24,9 @@ def test_api_key_fingerprint_is_stable_and_does_not_expose_secret():
     assert secret not in fingerprint
 
 
-def test_blank_ui_configuration_uses_glm_defaults():
+def test_blank_ui_configuration_uses_deepseek_defaults():
     assert build_llm_config("", "", "") == LLMConfig(
-        "glm", "glm-4.7-flash", ""
+        "deepseek", "deepseek-v4-flash", ""
     )
 
 
@@ -113,10 +113,14 @@ def test_consensus_rows_keep_excluded_and_unavailable_evidence_visible():
             "论文": "Paper",
             "纳入": "否",
             "立场": "不适用",
-            "研究类型": "unknown",
+            "研究类型": "未知设计",
             "质量": "unknown",
             "抽取置信度": 0.0,
+            "抽取置信度显示": "0%",
             "核心证据": "no direct outcome",
             "限制": "abstract_only",
         }
     ]
+    # 数值列可排序/统计，显示列保留百分比语义
+    assert isinstance(rows[0]["抽取置信度"], float)
+    assert rows[0]["抽取置信度显示"] == "0%"

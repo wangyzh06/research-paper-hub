@@ -1,5 +1,5 @@
 """
-ResearchPaperHub v4.0 - Windows 桌面应用入口
+ResearchPaperHub v4.1 - Windows 桌面应用入口
 双击运行即可启动，自动打开浏览器
 """
 import os
@@ -60,7 +60,7 @@ def start_streamlit():
     ]
 
     print("=" * 50)
-    print("  ResearchPaperHub v4.0")
+    print("  ResearchPaperHub v4.1")
     print("  智能学术研究助手")
     print("=" * 50)
     print()

@@ -29,11 +29,11 @@ class UsefulLLM:
         ]
 
 
-def test_glm_is_the_default_provider_consumed_by_new_sessions():
-    assert LLMConfig.default() == LLMConfig("glm", "glm-4.7-flash", "")
+def test_deepseek_is_the_default_provider_consumed_by_new_sessions():
+    assert LLMConfig.default() == LLMConfig("deepseek", "deepseek-v4-flash", "")
     assert (DEFAULT_LLM_PROVIDER, DEFAULT_LLM_MODEL) == (
-        "glm",
-        "glm-4.7-flash",
+        "deepseek",
+        "deepseek-v4-flash",
     )
 
 

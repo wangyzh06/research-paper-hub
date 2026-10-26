@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import os
 import logging
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,11 +61,11 @@ os.makedirs(PDF_DIR, exist_ok=True)
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_MODEL = "deepseek-v4-flash"
 SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
 OPENALEX_EMAIL = os.getenv("OPENALEX_EMAIL", "")
-DEFAULT_LLM_PROVIDER = "glm"
-DEFAULT_LLM_MODEL = "glm-4.7-flash"
+DEFAULT_LLM_PROVIDER = "deepseek"
+DEFAULT_LLM_MODEL = "deepseek-v4-flash"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 CHUNK_SIZE = 800
@@ -602,6 +605,8 @@ class SourceBatch:
     papers: tuple[dict, ...]
     total: int = 0
     error: SourceError | None = None
+    # 分页游标（目前仅 S2 bulk 使用；供后续翻页取更多结果）
+    next_token: str = ""
 
     @property
     def ok(self) -> bool:
@@ -644,6 +649,28 @@ def normalize_doi(value: str | None) -> str:
     return doi.strip()
 
 
+def _normalize_openalex_work(w: dict) -> dict:
+    """OpenAlex work → 统一 paper dict（供检索与引文图共用）。"""
+    authors = [
+        {"name": a.get("author", {}).get("display_name", "")}
+        for a in (w.get("authorships") or [])
+    ]
+    source = ((w.get("primary_location") or {}).get("source") or {})
+    return {
+        "id": (w.get("id") or "").split("/")[-1],
+        "source": "openalex",
+        "title": w.get("title") or "",
+        "abstract": _flatten_abstract(w.get("abstract_inverted_index")) or "",
+        "year": w.get("publication_year"),
+        "citation_count": w.get("cited_by_count", 0) or 0,
+        "venue": source.get("display_name") or "",
+        "authors": authors,
+        "doi": normalize_doi(w.get("doi")),
+        "url": w.get("id"),
+        "openalex_id": (w.get("id") or "").split("/")[-1],
+    }
+
+
 def _flatten_abstract(inverted_index: dict | None) -> str | None:
     if not inverted_index:
         return None
@@ -672,9 +699,22 @@ class OpenAlexClient:
         await self.client.aclose()
 
     async def search(self, query: str, limit: int = 20, page: int = 1,
-                     offset: int = 0) -> SourceBatch:
+                     offset: int = 0, filter_abstract: bool = False,
+                     scope_title_abstract: bool = False) -> SourceBatch:
         try:
-            r = await self.client.get("/works", params={"search": query, "per_page": limit, "page": page})
+            params = {"per_page": limit, "page": page}
+            if scope_title_abstract:
+                # 严格限定在标题与摘要内检索
+                params["filter"] = f"title_and_abstract.search:{query}"
+            else:
+                params["search"] = query
+
+            if filter_abstract:
+                current_filter = params.get("filter", "")
+                add_on = "has_abstract:true,type:article"
+                params["filter"] = f"{current_filter},{add_on}" if current_filter else add_on
+
+            r = await self.client.get("/works", params=params)
             r.raise_for_status()
             data = r.json()
             results = []
@@ -758,6 +798,82 @@ class OpenAlexClient:
         except Exception:
             return None
 
+    # === 引文图通道（成本远低于关键词检索）===
+    # OpenAlex 关键词检索每次消耗 10 积分（每日 1000 积分 ≈ 100 次调用），
+    # 但引文图查询实测仅 1 积分/次、单篇查询 0 积分，
+    # 因此引文扩展是配额受限时性价比最高的召回方式。
+
+    async def get_citing_works(self, work_id: str, limit: int = 200,
+                               sort_by_citations: bool = True) -> SourceBatch:
+        """向前引文：引用该论文的后续工作（1 积分/次）。
+
+        ``sort_by_citations``：按引用量降序返回。当一篇论文有数千篇引用者而我们
+        只需要 200 篇时，**排序决定了截断质量**——降序能保留最有影响力的引用者，
+        而非任意子集。此为 findpapers 的成熟做法。
+        """
+        wid = str(work_id or "").strip().split("/")[-1]
+        if not wid:
+            return SourceBatch("openalex", (), 0, None)
+        try:
+            params = {
+                "filter": f"cites:{wid}",
+                "per_page": max(1, min(int(limit), 200)),
+                "select": "id,doi,title,abstract_inverted_index,publication_year,"
+                          "cited_by_count,primary_location,authorships,type",
+            }
+            if sort_by_citations:
+                params["sort"] = "cited_by_count:desc"
+            r = await self.client.get("/works", params=params)
+            r.raise_for_status()
+            data = r.json()
+            results = [_normalize_openalex_work(w) for w in data.get("results", []) if isinstance(w, dict)]
+            total = (data.get("meta") or {}).get("count", len(results))
+            return SourceBatch("openalex", tuple(results), int(total or len(results)), None)
+        except Exception as error:
+            return SourceBatch("openalex", (), 0, _source_error(error))
+
+    async def hydrate_works(self, work_ids: Sequence[str], limit: int = 50) -> SourceBatch:
+        """批量补全论文记录（单次调用最多 50 篇，1 积分）。
+
+        实测：``filter=openalex_id:A|B|C`` 管道 OR 可行（DOI 的 OR 不受支持）。
+        """
+        ids = []
+        for value in work_ids:
+            wid = str(value or "").strip().split("/")[-1]
+            if wid and wid not in ids:
+                ids.append(wid)
+        if not ids:
+            return SourceBatch("openalex", (), 0, None)
+        chunk = ids[:max(1, min(int(limit), 50))]
+        try:
+            r = await self.client.get("/works", params={
+                "filter": "openalex_id:" + "|".join(chunk),
+                "per_page": len(chunk),
+                "select": "id,doi,title,abstract_inverted_index,publication_year,"
+                          "cited_by_count,primary_location,authorships,type",
+            })
+            r.raise_for_status()
+            data = r.json()
+            results = [_normalize_openalex_work(w) for w in data.get("results", []) if isinstance(w, dict)]
+            return SourceBatch("openalex", tuple(results), len(results), None)
+        except Exception as error:
+            return SourceBatch("openalex", (), 0, _source_error(error))
+
+    async def get_referenced_works(self, work_id: str, limit: int = 200) -> SourceBatch:
+        """向后引文：该论文引用过的奠基性工作（1 积分取 id + 1 积分批量补全）。"""
+        wid = str(work_id or "").strip().split("/")[-1]
+        if not wid:
+            return SourceBatch("openalex", (), 0, None)
+        try:
+            r = await self.client.get(f"/works/{wid}", params={"select": "referenced_works"})
+            r.raise_for_status()
+            refs = (r.json().get("referenced_works") or [])[:max(1, min(int(limit), 200))]
+            if not refs:
+                return SourceBatch("openalex", (), 0, None)
+            return await self.hydrate_works(refs, limit=50)
+        except Exception as error:
+            return SourceBatch("openalex", (), 0, _source_error(error))
+
 
 # ============================================================
 # Semantic Scholar Client
@@ -832,6 +948,33 @@ class SemanticScholarClient:
         except Exception:
             return []
 
+    async def get_citation_neighbors(self, paper_id: str, limit: int = 50,
+                                     direction: str = "citations") -> list[dict]:
+        """按 DOI / S2 id 取引文邻居，**直接返回带摘要的论文**。
+
+        与 Europe PMC 不同，S2 的 citations/references 端点可同时返回 abstract，
+        因此无需二次补全。实测该库对本领域的半导体器件文献覆盖优于 Europe PMC
+        （Europe PMC 常返回 0 条，且这些论文多无 pmid）。
+        """
+        if direction not in {"citations", "references"}:
+            return []
+        try:
+            r = await self.client.get(
+                f"/graph/v1/paper/{paper_id}/{direction}",
+                params={"limit": max(1, min(int(limit), 500)), "fields": _PAPER_FIELDS},
+            )
+            r.raise_for_status()
+            rows = r.json().get("data") or []
+            key = "citingPaper" if direction == "citations" else "citedPaper"
+            out = []
+            for entry in rows:
+                raw = entry.get(key) if isinstance(entry, dict) else None
+                if isinstance(raw, dict) and raw.get("title"):
+                    out.append(normalize_semantic_paper(raw))
+            return out
+        except Exception:
+            return []
+
     async def get_references(self, paper_id: str, limit: int = 50) -> list[dict]:
         try:
             r = await self.client.get(f"/graph/v1/paper/{paper_id}/references", params={"limit": limit, "fields": "title,authors,year,citationCount"})
@@ -850,6 +993,48 @@ class SemanticScholarClient:
         except Exception:
             return []
 
+    async def search_bulk(self, query: str, limit: int = 200,
+                          token: str = "") -> SourceBatch:
+        """S2 bulk 检索端点（独立于 /search 的配额）。
+
+        实测：单次调用返回 337 篇（/search 十次成功调用都拿不到这么多），
+        官方上限 1000 篇/次。用于宽召回层，显著降低请求次数与限流风险。
+        注意：bulk 不带相关性排序，需由本地重排处理。
+        """
+        try:
+            page_size = max(1, min(int(limit), 1000))
+            params = {
+                "query": query,
+                "fields": _PAPER_FIELDS,
+            }
+            if token:
+                params["token"] = token
+            r = await self.client.get("/graph/v1/paper/search/bulk", params=params)
+            r.raise_for_status()
+            data = r.json()
+            rows = data.get("data") or []
+            # bulk 可能返回 dict（按年份分组）或 list，统一处理
+            if isinstance(rows, dict):
+                flat = []
+                for value in rows.values():
+                    if isinstance(value, list):
+                        flat.extend(value)
+                rows = flat
+            papers = tuple(
+                normalize_semantic_paper(raw)
+                for raw in rows[:page_size]
+                if isinstance(raw, dict)
+            )
+            total = data.get("total")
+            try:
+                total = int(total) if total is not None else len(papers)
+            except (TypeError, ValueError):
+                total = len(papers)
+            return SourceBatch("semantic_scholar", papers, total, None,
+                               next_token=data.get("token") or "")
+        except Exception as error:
+            return SourceBatch("semantic_scholar", (), 0, _source_error(error))
+
 
 # ============================================================
 # LLM Provider Configurations
@@ -858,7 +1043,7 @@ LLM_PROVIDERS = {
     "deepseek": {
         "name": "DeepSeek",
         "base_url": "https://api.deepseek.com/v1",
-        "models": ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-coder", "deepseek-reasoner"],
+        "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
         "default_model": "deepseek-v4-flash",
         "env_key": "DEEPSEEK_API_KEY",
     },
@@ -887,8 +1072,8 @@ LLM_PROVIDERS = {
     "glm": {
         "name": "智谱清言 (GLM)",
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "models": [DEFAULT_LLM_MODEL, "glm-4.7"],
-        "default_model": DEFAULT_LLM_MODEL,
+        "models": ["glm-4.7-flash", "glm-4.7"],
+        "default_model": "glm-4.7-flash",
         "env_key": "ZHIPUAI_API_KEY",
     },
     "ollama": {
@@ -920,6 +1105,10 @@ class LLMRequestError(RuntimeError):
 
 
 def _llm_error_category(error: Exception) -> str:
+    # 已是 LLMRequestError 时保留其分类（如 rate_limit / empty_response），
+    # 否则重试逻辑会误判为不可重试。
+    if isinstance(error, LLMRequestError):
+        return error.category
     timeout_errors = _httpx_timeout_types()
     network_errors = _httpx_network_types()
     http_status_error = getattr(httpx, "HTTPStatusError", ())
@@ -946,12 +1135,17 @@ def _llm_error_category(error: Exception) -> str:
 # Generic LLM Client
 # ============================================================
 class LLMClient:
-    def __init__(self, provider: str = DEFAULT_LLM_PROVIDER, api_key: str = "", model: str = ""):
+    def __init__(self, provider: str = DEFAULT_LLM_PROVIDER, api_key: str = "", model: str = "",
+                 thinking: bool = True):
         cfg = LLM_PROVIDERS.get(provider, LLM_PROVIDERS[DEFAULT_LLM_PROVIDER])
         self.provider = provider if provider in LLM_PROVIDERS else DEFAULT_LLM_PROVIDER
         self.model = model or cfg["default_model"]
         self.base_url = cfg["base_url"]
         self.api_format = cfg.get("api_format", "openai")
+        # 是否允许隐藏推理。推理型模型在结构化抽取任务上会生成大量
+        # reasoning token（实测 1729 字符/次），拖慢 2.35 倍却对结果无益。
+        # 调用方可按任务类型覆盖：抽取/分类关闭，复杂综述生成保持开启。
+        self.thinking = thinking
 
         # Priority: explicit api_key > env var > config default
         if not api_key:
@@ -970,7 +1164,12 @@ class LLMClient:
                     headers["anthropic-version"] = "2023-06-01"
                 else:
                     headers["Authorization"] = f"Bearer {self.api_key}"
-            self._client = httpx.AsyncClient(base_url=self.base_url, headers=headers, timeout=httpx.Timeout(120.0))
+            # trust_env=False: 绕过系统代理(127.0.0.1:7890)，国内 API 直连更快更稳
+            self._client = httpx.AsyncClient(
+                base_url=self.base_url, headers=headers,
+                timeout=httpx.Timeout(60.0),
+                trust_env=False,
+            )
         return self._client
 
     async def __aenter__(self):
@@ -985,49 +1184,90 @@ class LLMClient:
             self._client = None
 
     async def complete_strict(self, messages: list[dict], temperature: float = 0.3,
-                              response_format: dict | None = None) -> str:
+                              response_format: dict | None = None,
+                              thinking: bool | None = None,
+                              max_tokens: int | None = None) -> str:
+        """严格补全：返回纯文本内容，失败抛 LLMRequestError。
+
+        ``thinking``：是否允许模型进行隐藏推理（默认沿用构造参数）。
+        证据抽取这类**结构化分类**任务不需要推理链，关掉后实测快 2.35 倍
+        且输出更短（651→241 completion tokens），统计结果不受影响。
+
+        ``max_tokens``：输出 token 上限。结构化抽取设为 ~700 足以容纳全部
+        18 个字段（实测精简 schema 仅需 142），同时能在模型跑偏时尽早截断，
+        避免无谓等待——这是"约束输出格式以减少无效 token"在远程 API 上的
+        可行落法（DeepSeek 不支持 json_schema 解码期约束）。
+        """
         client = self._get_client()
-        try:
-            if self.api_format == "anthropic":
-                system_msg = ""
-                user_messages = []
-                for message in messages:
-                    if message["role"] == "system":
-                        system_msg = message["content"]
-                    else:
-                        user_messages.append(message)
+        allow_thinking = self.thinking if thinking is None else thinking
+        max_attempts = 4
+        for attempt in range(max_attempts):
+            try:
+                if self.api_format == "anthropic":
+                    system_msg = ""
+                    user_messages = []
+                    for message in messages:
+                        if message["role"] == "system":
+                            system_msg = message["content"]
+                        else:
+                            user_messages.append(message)
+                    payload = {
+                        "model": self.model,
+                        "max_tokens": max_tokens or 4096,
+                        "temperature": temperature,
+                        "messages": user_messages,
+                    }
+                    if system_msg:
+                        payload["system"] = system_msg
+                    response = await client.post("/messages", json=payload)
+                    response.raise_for_status()
+                    return response.json()["content"][0]["text"].strip()
+
+                endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
                 payload = {
                     "model": self.model,
-                    "max_tokens": 4096,
+                    "messages": messages,
                     "temperature": temperature,
-                    "messages": user_messages,
+                    # 默认 8192：大 prompt + 推理模式下预算不足会导致空响应。
+                    # 调用方可通过 max_tokens 收紧（如结构化抽取用 700）。
+                    "max_tokens": max_tokens or 8192,
                 }
-                if system_msg:
-                    payload["system"] = system_msg
-                response = await client.post("/messages", json=payload)
+                # 显式关闭隐藏推理：DeepSeek 推理型模型（v4 系列）默认会先生成
+                # 大量 reasoning token 再输出，对"读摘要→填 JSON"这类任务纯属浪费。
+                # 实测：开启时 3.50s/次、651 completion tokens；
+                #       关闭后 1.49s/次、241 tokens，且 stance 判定准确率不变。
+                if not allow_thinking:
+                    payload["thinking"] = {"type": "disabled"}
+                if response_format:
+                    payload["response_format"] = response_format
+                response = await client.post(endpoint, json=payload)
                 response.raise_for_status()
-                return response.json()["content"][0]["text"].strip()
-
-            endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
-            payload = {
-                "model": self.model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": 4096,
-            }
-            if response_format:
-                payload["response_format"] = response_format
-            response = await client.post(endpoint, json=payload)
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"].strip()
-        except LLMRequestError:
-            raise
-        except Exception as error:
-            raise LLMRequestError(
-                self.provider,
-                _llm_error_category(error),
-                str(error),
-            ) from error
+                data = response.json()
+                choice = (data.get("choices") or [{}])[0]
+                content = ((choice.get("message") or {}).get("content") or "").strip()
+                if not content:
+                    # 空内容不是有效结果：可能因推理占满预算被截断，需重试
+                    finish = choice.get("finish_reason")
+                    raise LLMRequestError(
+                        self.provider,
+                        "rate_limit" if finish == "length" else "empty_response",
+                        f"模型返回空内容 (finish_reason={finish})",
+                    )
+                return content
+            except Exception as error:
+                category = _llm_error_category(error)
+                retryable = category in {"rate_limit", "empty_response", "timeout", "network"}
+                if retryable and attempt < max_attempts - 1:
+                    # 指数退避 + 基础等待，应对限流与推理占满预算被截断的情况
+                    wait_time = 2.0 * (attempt + 1)
+                    await _asyncio.sleep(wait_time)
+                    continue
+                raise LLMRequestError(
+                    self.provider,
+                    category,
+                    str(error),
+                ) from error
+        raise LLMRequestError(self.provider, "rate_limit", "重试次数用尽")
 
     async def _complete(self, messages: list[dict], temperature: float = 0.3) -> str:
         try:
@@ -1403,6 +1643,344 @@ class PubMedClient:
 
 
 # ============================================================
+# Google Scholar Client（可选源，默认关闭）
+# ============================================================
+# 重要声明与风险：
+#   1. Google Scholar **没有官方 API**，此处为 HTML 解析，Google 可随时改动结构；
+#   2. Google 服务条款禁止自动化抓取，使用者需自行评估合规风险；
+#   3. 实测（2026-10）经代理访问 24 次请求成功率 96%，失败表现为 HTTP 429 +
+#      "unusual traffic" 验证页，属**间歇性限流**而非永久封禁，等待后可恢复；
+#   4. 必须经代理访问，直连会超时（国内网络环境）。
+# 因此本客户端设计为：默认关闭、失败静默降级、绝不阻塞主检索流程。
+
+GS_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# 单次返回上限（Google Scholar 实际每页最多 10 条，即使 num=20）
+GS_PAGE_SIZE = 10
+
+
+def parse_google_scholar_meta(meta: str) -> tuple[str, str, int | None]:
+    """解析 Google Scholar 的 ``div.gs_a`` 文本。
+
+    格式为 ``authors - venue, year - publisher_domain``，例如::
+
+        "C Monier, AG Baca, SZ Sun… - Applied physics …, 2002 - pubs.aip.org"
+
+    注意：**年份必须用正则提取**——直接用 " - " 分割会把 venue 与 year 混在一起
+    （它们以逗号相连），这也是 paper-search-mcp 等实现常见解析错误的来源。
+    """
+    text = " ".join(str(meta or "").split())
+    parts = [p.strip() for p in text.split(" - ")]
+    authors = parts[0] if parts else ""
+    venue = parts[1] if len(parts) > 1 else ""
+    year_match = re.search(r"\b(19|20)\d{2}\b", text)
+    year = int(year_match.group(0)) if year_match else None
+    # 从 venue 段剥离年份及其后的域名
+    venue = re.sub(r",?\s*\b(19|20)\d{2}\b.*$", "", venue).strip().rstrip(",")
+    return authors, venue, year
+
+
+def parse_google_scholar_html(html: str) -> list[dict]:
+    """从搜索结果页解析论文条目（无需 BeautifulSoup，纯正则）。
+
+    选择器与 scholarly 保持一致：结果块 ``div.gs_r.gs_or.gs_scl``，
+    标题 ``h3.gs_rt``，元信息 ``div.gs_a``，摘要片段 ``div.gs_rs``。
+    """
+    import re as _re
+    if not html:
+        return []
+
+    papers: list[dict] = []
+    blocks = _re.split(r'<div class="gs_r gs_or gs_scl"', html)[1:]
+    for block in blocks:
+        # 标题 + 链接（部分条目为纯引用，无 <a>）
+        title_match = _re.search(
+            r'<h3 class="gs_rt".*?<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+            block, _re.S,
+        )
+        if title_match:
+            url = title_match.group(1)
+            raw_title = title_match.group(2)
+        else:
+            fallback = _re.search(r'<h3 class="gs_rt"[^>]*>(.*?)</h3>', block, _re.S)
+            if not fallback:
+                continue
+            url = ""
+            raw_title = fallback.group(1)
+
+        # 去掉 [PDF] / [HTML] / [BOOK] 之类的类型标记
+        raw_title = _re.sub(r'<span class="gs_ct[ac]"[^>]*>.*?</span>', " ", raw_title, flags=_re.S)
+        title = _re.sub(r"<[^>]+>", "", raw_title)
+        title = " ".join(title.split())
+        if not title:
+            continue
+
+        meta_match = _re.search(r'<div class="gs_a">(.*?)</div>', block, _re.S)
+        meta_text = _re.sub(r"<[^>]+>", "", meta_match.group(1)) if meta_match else ""
+        authors_raw, venue, year = parse_google_scholar_meta(meta_text)
+
+        abstract_match = _re.search(r'<div class="gs_rs">(.*?)</div>', block, _re.S)
+        abstract = ""
+        if abstract_match:
+            abstract = _re.sub(r"<[^>]+>", "", abstract_match.group(1))
+            abstract = " ".join(abstract.split())
+
+        cite_match = _re.search(r"Cited by (\d+)", block)
+        citation_count = int(cite_match.group(1)) if cite_match else 0
+
+        authors = [
+            {"name": name.strip()}
+            for name in authors_raw.split(",")
+            if name.strip() and "…" not in name
+        ]
+
+        papers.append({
+            "id": f"gs:{abs(hash(title)) & 0xFFFFFFFF:x}",
+            "source": "google_scholar",
+            "title": title,
+            "abstract": abstract,
+            "year": year,
+            "citation_count": citation_count,
+            "venue": venue,
+            "authors": authors,
+            "doi": "",  # Google Scholar 不直接提供 DOI
+            "url": url,
+        })
+    return papers
+
+
+class GoogleScholarClient:
+    """Google Scholar 抓取客户端（可选、默认关闭、需代理）。
+
+    仅用于补充 OpenAlex/Europe PMC 未覆盖的文献，**不作为主力源**。
+    """
+
+    def __init__(self, proxy: str = "", timeout: float = 20.0):
+        # 优先使用显式代理；否则交由 httpx 读取环境变量（trust_env=True）
+        kwargs: dict = {"base_url": "https://scholar.google.com", "headers": GS_HEADERS,
+                        "timeout": timeout}
+        if proxy:
+            kwargs["proxies"] = proxy
+        else:
+            kwargs["trust_env"] = True
+        self.client = httpx.AsyncClient(**kwargs)
+
+    async def __aenter__(self): return self
+    async def __aexit__(self, *args): await self.client.aclose()
+    async def aclose(self): await self.client.aclose()
+
+    async def search(self, query: str, limit: int = 10, page: int = 1,
+                     offset: int = 0, year_low: int | None = None,
+                     year_high: int | None = None, title_only: bool = False
+                     ) -> SourceBatch:
+        """检索 Google Scholar。
+
+        支持官方高级检索参数（实测 6/6 可用）：
+        ``as_ylo``/``as_yhi``（年份范围）、``as_occt=title``（限定标题）。
+        分页用 ``start``；注意实测相邻页存在少量重复条目，需依赖上层去重。
+        """
+        query = " ".join((query or "").split())
+        if not query:
+            return SourceBatch("google_scholar", (), 0, None)
+
+        per_page = max(1, min(int(limit), GS_PAGE_SIZE))
+        start = max(0, int(offset)) if offset else max(0, (int(page) - 1) * per_page)
+        params: dict = {"q": query, "hl": "en", "num": per_page}
+        if start:
+            params["start"] = start
+        if year_low:
+            params["as_ylo"] = int(year_low)
+        if year_high:
+            params["as_yhi"] = int(year_high)
+        if title_only:
+            params["as_occt"] = "title"
+
+        try:
+            r = await self.client.get("/scholar", params=params)
+            if r.status_code == 429:
+                # 间歇性限流：明确归类为 rate_limit，交由上层退避或跳过
+                return SourceBatch(
+                    "google_scholar", (), 0,
+                    SourceError("rate_limit", 429, True,
+                                "Google Scholar 返回 429（unusual traffic / 验证码）"),
+                )
+            r.raise_for_status()
+            papers = parse_google_scholar_html(r.text)
+            if not papers and ("unusual traffic" in r.text.lower()
+                               or "not a robot" in r.text.lower()):
+                return SourceBatch(
+                    "google_scholar", (), 0,
+                    SourceError("rate_limit", 200, True, "Google Scholar 触发人机验证"),
+                )
+            return SourceBatch("google_scholar", tuple(papers), len(papers), None)
+        except Exception as error:
+            return SourceBatch("google_scholar", (), 0, _source_error(error))
+
+    async def search_with_abstract(self, query: str, limit: int = 10, **kwargs
+                                   ) -> SourceBatch:
+        """仅返回带摘要的条目（Google Scholar 的摘要片段是本源的独特价值）。"""
+        batch = await self.search(query, limit=limit, **kwargs)
+        if not batch.ok:
+            return batch
+        papers = tuple(p for p in batch.papers if (p.get("abstract") or "").strip())
+        return SourceBatch("google_scholar", papers, len(papers), None)
+
+
+def normalize_europepmc_result(raw: dict) -> dict:
+    """Europe PMC core result → 统一 paper dict。
+
+    Europe PMC 单次可返回 pageSize=100 且实测无严格限流，字段丰富：
+    abstractText / citedByCount / journalInfo / pubTypeList / inEPMC（全文可用）。
+    """
+    journal = ((raw.get("journalInfo") or {}).get("journal") or {})
+    doi = normalize_doi(raw.get("doi"))
+    pmid = raw.get("pmid") or ""
+    pmcid = raw.get("pmcid") or ""
+    year = raw.get("pubYear")
+    try:
+        year = int(year) if year not in (None, "") else None
+    except (TypeError, ValueError):
+        year = None
+    identifier = pmid or pmcid or doi or raw.get("id", "")
+    pub_types = ((raw.get("pubTypeList") or {}).get("pubType") or [])
+    if isinstance(pub_types, str):
+        pub_types = [pub_types]
+    return {
+        "id": f"epmc:{identifier}",
+        "source": "europepmc",
+        "title": raw.get("title", "") or "",
+        "abstract": raw.get("abstractText", "") or "",
+        "year": year,
+        "citation_count": raw.get("citedByCount", 0) or 0,
+        "venue": journal.get("title", "") or "",
+        "authors": [
+            {"name": (a.get("fullName") or a.get("collectiveName") or "").strip()}
+            for a in ((raw.get("authorList") or {}).get("author") or [])
+        ],
+        "doi": doi,
+        "url": (
+            f"https://europepmc.org/article/MED/{pmid}" if pmid
+            else f"https://europepmc.org/article/PMC/{pmcid}" if pmcid
+            else ""
+        ),
+        "pmid": pmid,
+        "pmcid": pmcid,
+        # 具有全文（Europe PMC / PMC）时可用于 Methods/Results 抽取
+        "has_full_text": (raw.get("inEPMC") == "Y") or bool(raw.get("isOpenAccess") == "Y"),
+        "publication_types": [str(t) for t in pub_types],
+    }
+
+
+class EuropePMCClient:
+    """Europe PMC REST 客户端（免 Key、高吞吐）。
+
+    实测：8 次连续 pageSize=100 请求全部 200，无节流；
+    是 OpenAlex 每日 100 次配额之外最有价值的补充召回源。
+    """
+
+    def __init__(self):
+        # 注意：httpx 在请求路径以 "/" 开头时会**丢弃 base_url 的路径部分**，
+        # 因此这里把完整路径并入 base_url，并以相对路径（无前导 "/"）发起请求。
+        self.client = httpx.AsyncClient(
+            base_url="https://www.ebi.ac.uk/europepmc/webservices/rest/",
+            timeout=20.0,
+        )
+
+    async def __aenter__(self): return self
+    async def __aexit__(self, *args): await self.client.aclose()
+    async def aclose(self): await self.client.aclose()
+
+    async def search(self, query: str, limit: int = 100, page: int = 1,
+                     offset: int = 0) -> SourceBatch:
+        try:
+            page_size = max(1, min(int(limit), 100))
+            current = max(1, int(page))
+            params = {
+                "query": query,
+                "format": "json",
+                "pageSize": page_size,
+                "resultType": "core",
+                # 引用量降序：优先高质量证据，配合本地质量精排
+                "sort": "CITED desc",
+            }
+            if (offset or 0) > 0 and page_size:
+                current = max(1, (int(offset) // page_size) + 1)
+            if current > 1:
+                params["page"] = current
+            r = await self.client.get("search", params=params)
+            r.raise_for_status()
+            data = r.json()
+            result_list = (data.get("resultList") or {}).get("result") or []
+            results = [
+                normalize_europepmc_result(item)
+                for item in result_list
+                if isinstance(item, dict)
+            ]
+            try:
+                total = int(data.get("hitCount") or len(results))
+            except (TypeError, ValueError):
+                total = len(results)
+            return SourceBatch("europepmc", tuple(results), total, None)
+        except Exception as error:
+            return SourceBatch("europepmc", (), 0, _source_error(error))
+
+    async def get_citations(self, pmid: str, limit: int = 50) -> list[dict]:
+        """向前引文：谁引用了这篇论文（免费、无配额）。
+
+        返回的是**无摘要的引用存根**（title/pubYear/id/citedByCount），
+        需配合 ``hydrate`` 补齐摘要后才能进入证据抽取。
+        """
+        try:
+            r = await self.client.get(f"MED/{pmid}/citations",
+                                      params={"format": "json", "pageSize": min(int(limit), 1000)})
+            r.raise_for_status()
+            data = r.json()
+            return list((data.get("citationList") or {}).get("citation") or [])
+        except Exception:
+            return []
+
+    async def get_references(self, pmid: str, limit: int = 50) -> list[dict]:
+        """向后引文：这篇论文引用了谁（免费、无配额）。"""
+        try:
+            r = await self.client.get(f"MED/{pmid}/references",
+                                      params={"format": "json", "pageSize": min(int(limit), 1000)})
+            r.raise_for_status()
+            data = r.json()
+            return list((data.get("referenceList") or {}).get("reference") or [])
+        except Exception:
+            return []
+
+    async def hydrate(self, ids: Sequence[str], limit: int = 50) -> SourceBatch:
+        """把引文存根批量补全为带摘要的完整记录（单次调用完成）。
+
+        实测：``EXT_ID:a OR b OR c`` 形式一次可返回多条 core 记录且含 abstractText，
+        远优于逐条查询。
+        """
+        cleaned = [str(i).strip() for i in ids if str(i).strip()]
+        if not cleaned:
+            return SourceBatch("europepmc", (), 0, None)
+        chunk = cleaned[:max(1, min(int(limit), 50))]
+        try:
+            query = " OR ".join(f"EXT_ID:{i}" for i in chunk)
+            r = await self.client.get("search", params={
+                "query": query, "format": "json",
+                "pageSize": len(chunk), "resultType": "core",
+            })
+            r.raise_for_status()
+            data = r.json()
+            rows = ((data.get("resultList") or {}).get("result") or [])
+            results = [normalize_europepmc_result(x) for x in rows if isinstance(x, dict)]
+            return SourceBatch("europepmc", tuple(results), len(results), None)
+        except Exception as error:
+            return SourceBatch("europepmc", (), 0, _source_error(error))
+
+
+# ============================================================
 # Search Engine
 # ============================================================
 import re as _re
@@ -1410,6 +1988,10 @@ import asyncio as _asyncio
 
 def _contains_chinese(text: str) -> bool:
     return bool(_re.search(r'[\u4e00-\u9fff]', text))
+
+
+# 实测上限：超过此词数的检索式在 OpenAlex / Europe PMC / S2 上召回为 0
+MAX_QUERY_WORDS = 12
 
 
 @dataclass(frozen=True)
@@ -1528,6 +2110,8 @@ class SearchEngine:
             "semantic_scholar": 1.05,
             "crossref": 0.25,
             "pubmed": 1.05,
+            # Europe PMC 实测无严格限流（8/8 连续 100 篇请求通过）
+            "europepmc": 0.2,
         }
         self.source_request_caps = (
             dict(source_request_caps)
@@ -1543,11 +2127,13 @@ class SearchEngine:
         self._ss = None  # Semantic Scholar
         self._cr = None  # Crossref
         self._pm = None  # PubMed
+        self._epmc = None  # Europe PMC
         self._oa = clients.get("openalex")
         self._arx = clients.get("arxiv")
         self._ss = clients.get("semantic_scholar")
         self._cr = clients.get("crossref")
         self._pm = clients.get("pubmed")
+        self._epmc = clients.get("europepmc")
         self.query_planner = query_planner or QueryPlanner(self._new_llm_client)
 
     def _new_llm_client(self):
@@ -1565,6 +2151,7 @@ class SearchEngine:
                 self._ss = SemanticScholarClient()
             if self._cr is None: self._cr = CrossrefClient()
             if self._pm is None: self._pm = PubMedClient()
+            if self._epmc is None: self._epmc = EuropePMCClient()
         self.clients = {
             name: client
             for name, client in {
@@ -1573,6 +2160,7 @@ class SearchEngine:
                 "semantic_scholar": self._ss,
                 "crossref": self._cr,
                 "pubmed": self._pm,
+                "europepmc": self._epmc,
             }.items()
             if client is not None
         }
@@ -1622,10 +2210,15 @@ class SearchEngine:
             source_cap = self.source_request_caps.get(source_name, 100)
             source_request_limit = min(request_limit, source_cap)
             source_variant_budget = min(per_variant_budget, source_cap)
+            # Semantic Scholar 限流严格（1 req/s），只发前2个变体
+            if source_name == "semantic_scholar":
+                variants_to_send = plan.variants[:2]
+            else:
+                variants_to_send = plan.variants
             tasks.append(self._fetch_source_variants(
                 source_name,
                 client,
-                plan.variants,
+                variants_to_send,
                 source_request_limit,
                 source_variant_budget,
             ))
@@ -1796,7 +2389,8 @@ class SearchEngine:
             incoming.get("citation_count", 0) or 0,
         )
 
-    def _merge_and_rank(self, plan: QueryPlan, occurrences, sort: str) -> list[dict]:
+    def _merge_and_rank(self, plan: QueryPlan, occurrences, sort: str,
+                        extra_query_terms: Sequence[str] | None = None) -> list[dict]:
         by_identity = {}
         for source_name, variant_index, rank, raw in occurrences:
             paper = dict(raw)
@@ -1804,11 +2398,17 @@ class SearchEngine:
             paper.setdefault("source", source_name)
             identity = self._paper_identity(paper)
             if identity not in by_identity:
-                paper["sources"] = [paper["source"]]
+                # 保留调用方已标注的来源列表（如引文扩展带入的多源信息），
+                # 否则跨源一致性信号会被清零。
+                existing_sources = [s for s in (paper.get("sources") or []) if s]
+                if paper["source"] not in existing_sources:
+                    existing_sources.insert(0, paper["source"])
+                paper["sources"] = existing_sources or [paper["source"]]
                 paper["_fusion_score"] = 0.0
                 by_identity[identity] = paper
             else:
                 self._merge_paper(by_identity[identity], paper)
+            # 主检索(slot 0)权重最高；维度召回(slot 1)稍低但仍参与融合
             query_weight = 1.25 if variant_index == 0 else 1.0
             by_identity[identity]["_fusion_score"] += query_weight / (60 + rank)
 
@@ -1819,6 +2419,11 @@ class SearchEngine:
             for token in variant.split()
             if len(token) > 1
         }
+        # 维度检索式的词项也纳入词面重叠计算，否则维度召回的论文词面分恒为 0
+        for extra in (extra_query_terms or ()):
+            for token in self._normalized_title(extra).split():
+                if len(token) > 1:
+                    query_terms.add(token)
         original_title = self._normalized_title(plan.original)
         for paper in by_identity.values():
             text = self._normalized_title(
@@ -1828,7 +2433,16 @@ class SearchEngine:
             paper["_lexical_score"] = overlap / max(1, len(query_terms))
             if self._normalized_title(paper.get("title", "")) == original_title:
                 paper["_fusion_score"] += 2.0
-            paper["_score"] = paper["_fusion_score"] + 0.25 * paper["_lexical_score"]
+
+            # 跨源一致性信号：多个独立数据源都收录 → 更可能是真实核心文献。
+            # 借鉴 findpapers 的 Paper.found_in（我们此前采集了 sources 却未用于排序）。
+            source_count = len({s for s in (paper.get("sources") or []) if s})
+            paper["_source_agreement"] = min(max(source_count - 1, 0), 3)
+            paper["_score"] = (
+                paper["_fusion_score"]
+                + 0.25 * paper["_lexical_score"]
+                + 0.3 * paper["_source_agreement"]
+            )
 
         papers = list(by_identity.values())
         if sort == "year":
@@ -1926,6 +2540,430 @@ class SearchEngine:
                 seen.add(key)
                 unique.append(p)
         return unique[:limit]
+
+    async def search_consensus_candidates(
+        self,
+        query: str,
+        domain: str = "general",
+        limit: int = 80,
+        s2_api_key: str = "",
+        query_variants: Sequence[str] | None = None,
+        dimension_queries: Sequence[str] | None = None,
+        citation_expansion: bool = True,
+        citation_seeds: int = 5,
+        citation_neighbors: int = 40,
+        citation_depth: int = 2,
+        citation_papers_per_level: int = 60,
+        citation_expansion_per_level: int = 8,
+    ) -> SearchResponse:
+        """为共识分析定制的高通量、极低请求安全定向检索通道（对标 Consensus 搜索策略）。
+
+        1. 支持多级学术检索式变体（主词检索 + 深度长句），兼顾召回广度与语义深度；
+        2. 全领域激活 Semantic Scholar（S2），带有 1.05s 串行锁与静默容错；
+        3. 按学科路由：计算机/物理加入 arXiv，生物医学加入 PubMed；
+        4. 彻底排除 Crossref（无摘要率高，避免浪费请求与配额）；
+        5. OpenAlex 原生开启 has_abstract 与标题摘要字段限定；
+        6. ``dimension_queries``：Consensus Deep 式 7 维度短检索式，逐维度召回后合并。
+           **关键**：实测长自然语言句子（>12 词）在各引擎召回为 0，因此维度检索式
+           必须短；此处也会过滤掉过长的检索式以节省配额。
+        """
+        clean_q = " ".join(query.strip().split())
+        # 清除输入中可能夹带的成对多余双引号
+        clean_q = clean_q.replace('"', '').replace("'", '').strip()
+
+        # 整理检索变体
+        variants_list = [clean_q] if clean_q else []
+        if query_variants:
+            for v in query_variants:
+                cv = " ".join(v.strip().split()).replace('"', '').replace("'", '').strip()
+                if cv and cv not in variants_list:
+                    variants_list.append(cv)
+
+        # 维度检索式：过滤过长项（长句召回为 0，纯属浪费配额）
+        dimension_list: list[str] = []
+        if dimension_queries:
+            for dq in dimension_queries:
+                cdq = " ".join(str(dq).strip().split()).replace('"', '').replace("'", '').strip()
+                if not cdq:
+                    continue
+                if len(cdq.split()) > MAX_QUERY_WORDS:
+                    continue
+                if cdq not in dimension_list:
+                    dimension_list.append(cdq)
+
+        if not variants_list:
+            variants_list = [clean_q]
+
+        plan = QueryPlan(clean_q, tuple(variants_list), False, None, _query_kind(clean_q))
+        if (not clean_q and not dimension_list) or limit <= 0:
+            return SearchResponse((), plan, ())
+
+        await self._ensure_clients()
+
+        # 动态支持外部传入的 S2 Key（如设置页面配置）
+        effective_s2_key = s2_api_key or SEMANTIC_SCHOLAR_API_KEY
+        if effective_s2_key and ("semantic_scholar" not in self.clients or self.clients["semantic_scholar"] is None):
+            self.clients["semantic_scholar"] = SemanticScholarClient()
+
+        # 确定启用的源（严格排除 crossref：无摘要，浪费 LLM 配额）
+        target_sources: list[str] = ["openalex"]
+        if "semantic_scholar" in self.clients and self.clients["semantic_scholar"] is not None:
+            target_sources.append("semantic_scholar")
+        # Europe PMC 免 Key、高吞吐、覆盖材料/器件与生物医学，作为通用第二召回源
+        if "europepmc" in self.clients and self.clients["europepmc"] is not None:
+            target_sources.append("europepmc")
+
+        d = (domain or "general").lower()
+        if d in {"cs_physics", "computer_science", "physics"}:
+            if "arxiv" in self.clients and self.clients["arxiv"] is not None:
+                target_sources.append("arxiv")
+        elif d in {"biomedicine", "medicine", "biology"}:
+            if "pubmed" in self.clients and self.clients["pubmed"] is not None:
+                target_sources.append("pubmed")
+
+        occurrences = []
+        source_calls: dict[str, list[SourceBatch]] = {name: [] for name in target_sources}
+
+        async def fetch_one_source(source_name: str) -> tuple[str, SourceBatch]:
+            client = self.clients[source_name]
+            try:
+                # 遵循各源流控间隔保护（如 S2 1.05s 锁）
+                interval = self.source_intervals.get(source_name, 0.0)
+                last_request = self._source_last_request.get(source_name)
+                if interval > 0 and last_request is not None:
+                    remaining = interval - (time.monotonic() - last_request)
+                    if remaining > 0:
+                        await _asyncio.sleep(remaining)
+                self._source_last_request[source_name] = time.monotonic()
+
+                if source_name == "openalex":
+                    # OpenAlex 每次调用固定消耗 10 积分（实测 per_page 1~200 同价），
+                    # 因此单次拉满 200 篇 = 零边际成本的双倍召回。
+                    oa_papers = []
+                    oa_seen_ids = set()
+                    oa_total = 0
+                    primary_oa = variants_list[0]
+                    batch_p = await client.search(
+                        primary_oa, limit=200, page=1, filter_abstract=True, scope_title_abstract=False
+                    )
+                    oa_total += batch_p.total
+                    for p in batch_p.papers:
+                        pid = p.get("id") or p.get("title")
+                        if pid and pid not in oa_seen_ids:
+                            oa_seen_ids.add(pid)
+                            oa_papers.append(p)
+                    batch = SourceBatch("openalex", tuple(oa_papers), oa_total, None)
+
+                elif source_name == "europepmc":
+                    # Europe PMC 免 Key、高吞吐，单次 100 篇；用于补充 OpenAlex 未覆盖的
+                    # 生物医学/材料文献。为避免过载，主检索词取核心短句。
+                    epmc_query = clean_q
+                    words = clean_q.split()
+                    if len(words) > 12:
+                        epmc_query = " ".join(words[:12])
+                    batch = await client.search(epmc_query, limit=100, page=1)
+
+                elif source_name == "semantic_scholar":
+                    # 优先使用 bulk 端点（独立配额，单次可返 1000 篇），
+                    # /search 在共享池限流下实测成功率仅约 30%，仅作兜底。
+                    s2_query = clean_q
+                    words = clean_q.split()
+                    if len(words) > 6:
+                        s2_query = " ".join(words[:5])
+                    bulk_fn = getattr(client, "search_bulk", None)
+                    batch = None
+                    if callable(bulk_fn):
+                        batch = await bulk_fn(s2_query, limit=200)
+                    if batch is None or not batch.papers:
+                        try:
+                            fallback = await client.search(s2_query, limit=30, page=1, offset=0)
+                            if fallback.papers or batch is None:
+                                batch = fallback
+                        except Exception:
+                            if batch is None:
+                                raise
+
+                elif source_name == "arxiv":
+                    batch = await client.search(clean_q, limit=20, page=1)
+                elif source_name == "pubmed":
+                    batch = await client.search(clean_q, limit=20, page=1)
+                else:
+                    batch = SourceBatch(source_name, (), 0, None)
+
+                return source_name, batch
+            except Exception as err:
+                return source_name, SourceBatch(source_name, (), 0, _source_error(err))
+
+        tasks = [fetch_one_source(s) for s in target_sources]
+        results = await _asyncio.gather(*tasks, return_exceptions=True)
+
+        for res in results:
+            if isinstance(res, Exception):
+                continue
+            source_name, batch = res
+            source_calls[source_name].append(batch)
+            for rank, paper in enumerate(batch.papers, start=1):
+                occurrences.append((source_name, 0, rank, paper))
+
+        # === 7 维度多维召回（对标 Consensus Deep）===
+        # 逐维度查询 OpenAlex + Europe PMC，把各维度结果并入统一候选池。
+        # 实测：单条长句召回 0 篇，而 7 维度 × 短检索式可召回上千篇。
+        if dimension_list:
+            # 源健康状态：某源出现限流/网络错误后即停用，避免 14 次维度查询
+            # 全部撞在同一个已耗尽的配额上（OpenAlex 每日仅 1000 积分 = 100 次调用）。
+            source_disabled: dict[str, bool] = {}
+
+            async def fetch_dimension(dim_query: str) -> list[tuple[str, int, dict]]:
+                """返回 (source, rank, paper) 三元组；单维度失败不影响整体。"""
+                rows: list[tuple[str, int, dict]] = []
+                for src in ("openalex", "europepmc"):
+                    if source_disabled.get(src):
+                        continue
+                    client = self.clients.get(src)
+                    if client is None:
+                        continue
+                    try:
+                        interval = self.source_intervals.get(src, 0.0)
+                        last_request = self._source_last_request.get(src)
+                        if interval > 0 and last_request is not None:
+                            remaining = interval - (time.monotonic() - last_request)
+                            if remaining > 0:
+                                await _asyncio.sleep(remaining)
+                        self._source_last_request[src] = time.monotonic()
+
+                        if src == "openalex":
+                            batch = await client.search(
+                                dim_query, limit=200, page=1,
+                                filter_abstract=True, scope_title_abstract=False,
+                            )
+                        else:
+                            batch = await client.search(dim_query, limit=100, page=1)
+                        if batch.error is not None:
+                            # 限流/认证类错误短期内不会自愈，直接停用该源
+                            if batch.error.category in {"rate_limit", "authentication"}:
+                                source_disabled[src] = True
+                            continue
+                        for rank, paper in enumerate(batch.papers, start=1):
+                            rows.append((src, rank, paper))
+                    except Exception:
+                        # 维度检索失败静默跳过，保证整体可用性
+                        continue
+                return rows
+
+            dimension_results = await _asyncio.gather(
+                *(fetch_dimension(dq) for dq in dimension_list),
+                return_exceptions=True,
+            )
+            for dim_result in dimension_results:
+                if isinstance(dim_result, Exception) or not dim_result:
+                    continue
+                for source_name, rank, paper in dim_result:
+                    # dimension=1 标记为多维召回，参与融合排序但权重略低于主检索
+                    occurrences.append((source_name, 1, rank, paper))
+
+        source_batches = tuple(
+            self._combine_source_batches(name, source_calls[name])
+            for name in target_sources
+        )
+        merged = self._merge_and_rank(
+            plan, occurrences, sort="relevance",
+            extra_query_terms=tuple(dimension_list) + tuple(variants_list[1:]),
+        )
+
+        # === 引文网络扩展（Citation Graph / Snowballing）===
+        # 对标 Consensus Deep：「Discover additional papers by following citation
+        # connections」。关键词检索只能命中字面匹配，引文网络能找到主题相关但
+        # 用词不同的工作（含奠基性经典文献）。
+        #
+        # 成本优势（实测）：OpenAlex 关键词检索 10 积分/次，引文图仅 1 积分/次；
+        # Europe PMC 引文接口完全免费。因此这是配额受限时性价比最高的召回方式。
+        if citation_expansion and merged:
+            try:
+                expansion = await self._expand_citation_graph(
+                    merged, seed_count=citation_seeds,
+                    max_neighbors=citation_neighbors,
+                    max_depth=citation_depth,
+                    max_papers_per_level=citation_papers_per_level,
+                    max_expansion_per_level=citation_expansion_per_level,
+                )
+                for paper in expansion:
+                    paper["_fusion_score"] = paper.get("_fusion_score", 0.0) + 0.35
+                    paper["_score"] = paper.get("_score", 0.0) + 0.35
+                merged.extend(expansion)
+            except Exception:
+                # 引文扩展失败绝不阻塞主检索
+                pass
+
+        selected = self._select_diverse(merged, source_batches, limit)
+        return SearchResponse(tuple(selected), plan, source_batches)
+
+    async def _fetch_citation_neighbours(self, papers: Sequence[dict],
+                                         max_neighbors: int = 40) -> list[dict]:
+        """取给定论文集合的直接引文邻居（前向 + 后向），已去重。
+
+        三源分工（按成本从低到高）：
+          1. Europe PMC——完全免费，但需要 pmid，且只返回无摘要存根，需 hydrate
+          2. S2 按 DOI——能覆盖 Europe PMC 未收录的半导体器件文献（常无 pmid）
+          3. OpenAlex——1 积分/次，作为兜底
+        仅返回**带摘要**的论文，因为证据抽取必须有摘要。
+        """
+        outgoing: dict[str, dict] = {}
+        stub_ids: list[str] = []
+
+        def keep(paper: dict) -> None:
+            if not paper or not paper.get("title"):
+                return
+            if not (paper.get("abstract") or "").strip():
+                return
+            outgoing.setdefault(self._paper_identity(paper), paper)
+
+        epmc = self.clients.get("europepmc")
+        s2 = self.clients.get("semantic_scholar")
+        openalex = self.clients.get("openalex")
+
+        # --- 1) Europe PMC（免费）---
+        if epmc is not None and hasattr(epmc, "get_citations"):
+            for paper in papers:
+                pmid = paper.get("pmid")
+                if not pmid:
+                    continue
+                try:
+                    citations = await epmc.get_citations(pmid, limit=max_neighbors)
+                    references = await epmc.get_references(pmid, limit=max_neighbors)
+                except Exception:
+                    continue
+                for stub in list(citations) + list(references):
+                    stub_id = str(stub.get("id") or "").strip()
+                    if stub_id:
+                        stub_ids.append(stub_id)
+
+        # --- 2) S2 按 DOI（覆盖无 pmid 的文献）---
+        if s2 is not None and hasattr(s2, "get_citation_neighbors"):
+            for paper in papers:
+                doi = normalize_doi(paper.get("doi"))
+                if not doi:
+                    continue
+                for direction in ("citations", "references"):
+                    try:
+                        neighbours = await s2.get_citation_neighbors(
+                            f"DOI:{doi}", limit=max_neighbors, direction=direction,
+                        )
+                    except Exception:
+                        continue
+                    for neighbour in neighbours:
+                        keep(neighbour)
+
+        # --- 3) OpenAlex（1 积分/次，兜底）---
+        if openalex is not None and hasattr(openalex, "get_citing_works"):
+            for paper in papers:
+                wid = paper.get("openalex_id") or ""
+                if not wid:
+                    continue
+                try:
+                    fwd = await openalex.get_citing_works(wid, limit=max_neighbors)
+                    for p in fwd.papers:
+                        keep(p)
+                except Exception:
+                    pass
+                try:
+                    bwd = await openalex.get_referenced_works(wid, limit=max_neighbors)
+                    for p in bwd.papers:
+                        keep(p)
+                except Exception:
+                    pass
+
+        # --- Europe PMC 存根批量补全（单次最多 50 条）---
+        if epmc is not None and stub_ids:
+            unique_stubs = list(dict.fromkeys(stub_ids))[: max_neighbors * 3]
+            for start in range(0, len(unique_stubs), 50):
+                chunk = unique_stubs[start:start + 50]
+                if not chunk:
+                    continue
+                try:
+                    batch = await epmc.hydrate(chunk, limit=50)
+                except Exception:
+                    continue
+                for p in batch.papers:
+                    keep(p)
+
+        return list(outgoing.values())
+
+    async def _expand_citation_graph(self, seeds: Sequence[dict],
+                                     seed_count: int = 5,
+                                     max_neighbors: int = 40,
+                                     max_depth: int = 2,
+                                     max_papers_per_level: int = 60,
+                                     max_expansion_per_level: int = 8,
+                                     ) -> list[dict]:
+        """从高相关种子出发做**分层 BFS** 引文扩展。
+
+        返回**新增**论文（已与种子去重），由调用方合并进候选池。
+
+        设计借鉴 findpapers（4 年迭代的成熟实现）：
+          引文网络是**指数爆炸**的（1 → 50 → 2500 → …），因此必须有两个独立上限：
+            - ``max_papers_per_level``：每层**入库**上限（按引用量取 top N）
+            - ``max_expansion_per_level``：每层**参与下一轮扩展**的上限（更严格）
+          二者分离，才能在加深遍历的同时不失控。
+          这也是我们此前"单轮浅扩展"与成熟实现的主要差距。
+
+        实测约束：本领域大量文献无 pmid，因此 Europe PMC 覆盖不全，
+        必须由 S2（按 DOI）与 OpenAlex 补位。
+        """
+        def seed_score(p: dict) -> tuple:
+            return (
+                1 if p.get("pmid") else 0,
+                1 if p.get("doi") else 0,
+                1 if p.get("openalex_id") else 0,
+                p.get("citation_count") or 0,
+            )
+
+        ranked = sorted(
+            (p for p in seeds
+             if p.get("pmid") or p.get("doi") or p.get("openalex_id")),
+            key=seed_score, reverse=True,
+        )[:max(1, seed_count)]
+        if not ranked:
+            return []
+
+        # visited 跨层共享，避免重复抓取与循环
+        visited: set[str] = {self._paper_identity(p) for p in seeds}
+        collected: dict[str, dict] = {}
+        frontier = list(ranked)
+
+        def top_n(items: list[dict], n: int) -> list[dict]:
+            return sorted(
+                items, key=lambda p: p.get("citation_count") or 0, reverse=True
+            )[:max(1, n)]
+
+        for level in range(1, max(0, int(max_depth)) + 1):
+            if not frontier:
+                break
+            try:
+                neighbours = await self._fetch_citation_neighbours(
+                    frontier, max_neighbors=max_neighbors
+                )
+            except Exception:
+                break
+
+            # 过滤已访问
+            fresh: list[dict] = []
+            for paper in neighbours:
+                identity = self._paper_identity(paper)
+                if identity in visited:
+                    continue
+                visited.add(identity)
+                fresh.append(paper)
+            if not fresh:
+                break
+
+            # 入库：按引用量取 top N
+            for paper in top_n(fresh, max_papers_per_level):
+                collected.setdefault(self._paper_identity(paper), paper)
+
+            # 扩展：更严格的独立上限，防止下一轮指数增长
+            frontier = top_n(fresh, max_expansion_per_level)
+
+        return list(collected.values())
 
 
 # ============================================================

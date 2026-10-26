@@ -82,14 +82,20 @@ def consensus_rows(analysis: ConsensusAnalysis) -> list[dict]:
         "uncertain": "不确定",
         "not_applicable": "不适用",
     }
+    try:
+        from consensus import STUDY_LABELS
+    except Exception:
+        STUDY_LABELS = {}
     return [
         {
             "论文": item.title,
             "纳入": "是" if item.eligible else "否",
             "立场": stance_labels.get(item.stance, "不确定"),
-            "研究类型": item.study_type,
+            "研究类型": STUDY_LABELS.get(item.study_type, item.study_type),
             "质量": item.quality,
-            "抽取置信度": item.confidence,
+            # 数值列供排序/统计使用；显示列保留百分比语义供表格渲染
+            "抽取置信度": float(item.confidence),
+            "抽取置信度显示": f"{item.confidence:.0%}",
             "核心证据": item.claim if item.eligible else item.exclusion_reason,
             "限制": "、".join(item.limitations),
         }

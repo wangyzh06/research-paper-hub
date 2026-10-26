@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 echo ========================================
-echo  ResearchPaperHub v4.0 - 安装向导
+echo  ResearchPaperHub v4.1 - 安装向导
 echo ========================================
 echo.
 

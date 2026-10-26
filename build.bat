@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 echo ========================================
-echo  ResearchPaperHub v4.0 - 打包工具
+echo  ResearchPaperHub v4.1 - 打包工具
 echo ========================================
 echo.
 
